@@ -1,0 +1,184 @@
+"""
+Procedurally-built 3D actors for the Ursina scene: the player rig and
+the three obstacle kinds. Everything here is assembled from Ursina's
+built-in primitive meshes (cube/sphere/procedural cylinder) with solid
+colors and lighting -- no external model or texture files, so there's
+nothing to download, license, or go missing on a teammate's laptop.
+
+Every entity here uses lit_with_shadows_shader explicitly -- plain
+Ursina Entities are *not* automatically lit just because a Light exists
+in the scene; Panda3D's fixed-function lighting pipeline kicks in
+instead and overrides the vertex color with a flat white material,
+which is exactly what turns a scene "white" if this shader is missing
+(see game.py's lighting setup for the matching note).
+
+Cylinder pivot note: Ursina's procedural Cylinder mesh is built from
+(0,0,0) to (0,height,0) by default -- its pivot is at one END, not the
+center, and not hanging downward. Two helpers below build it two
+different ways depending on what a given part needs:
+  - _cylinder(): centered (start=-0.5) -- for parts meant to span
+    symmetrically around their placement point (barrel, bands, chains).
+  - _limb(): pivoted at the TOP, hanging down (direction=(0,-1,0)) --
+    for arms/legs, which need to swing from a joint (shoulder/hip) like
+    a real hinge, not from their own far tip.
+
+Obstacle height storytelling (matches game.py's avoided() rule table):
+    high   -- a beam hanging near the top of the lane   -> duck under it
+    medium -- a barrel at chest height, center of lane   -> jump OR duck
+    low    -- a hurdle bar at ground level               -> jump over it
+"""
+import math
+
+from ursina import Entity, color
+from ursina.models.procedural.cylinder import Cylinder
+from ursina.shaders import lit_with_shadows_shader
+
+HIGH_Y = 2.05
+MEDIUM_Y = 1.05
+LOW_Y = 0.35
+
+OBSTACLE_COLORS = {
+    "high": color.rgb32(255, 176, 40),
+    "medium": color.rgb32(150, 92, 52),
+    "low": color.rgb32(224, 60, 60),
+}
+
+
+def _cube(**kwargs):
+    kwargs.setdefault("model", "cube")
+    kwargs.setdefault("shader", lit_with_shadows_shader)
+    return Entity(**kwargs)
+
+
+def _cylinder(**kwargs):
+    """Centered cylinder: spans -0.5..+0.5 along its local axis, so it
+    extends symmetrically around wherever it's placed/rotated."""
+    kwargs.setdefault("shader", lit_with_shadows_shader)
+    return Entity(model=Cylinder(resolution=10, start=-0.5), **kwargs)
+
+
+def _limb(**kwargs):
+    """A limb segment pivoted at its TOP, hanging straight down --
+    rotating it swings from the joint (shoulder/hip), not from its own
+    tip, matching how a real arm/leg hinges."""
+    kwargs.setdefault("shader", lit_with_shadows_shader)
+    return Entity(model=Cylinder(resolution=8, direction=(0, -1, 0)), **kwargs)
+
+
+def build_obstacle(kind, lane_width):
+    """Returns a root Entity for one obstacle instance; game.py positions
+    it via .x/.z and destroys it once it's passed the player."""
+    root = Entity()
+    span = lane_width * 0.82
+
+    if kind == "high":
+        root.y = HIGH_Y
+        _cube(parent=root, color=OBSTACLE_COLORS["high"], scale=(span, 0.34, 0.55))
+        # hazard-stripe teeth along the front face
+        n_teeth = max(3, int(span / 0.35))
+        for i in range(n_teeth):
+            tx = -span / 2 + (i + 0.5) * (span / n_teeth)
+            _cube(parent=root, color=color.rgb32(35, 35, 40),
+                  scale=(span / n_teeth * 0.5, 0.36, 0.06), position=(tx, 0, -0.29))
+        # support chains up to a fixed "ceiling"
+        for cx in (-span * 0.32, span * 0.32):
+            _cylinder(parent=root, color=color.rgb32(90, 90, 100),
+                      scale=(0.05, 1.15, 0.05), position=(cx, 0.9, 0))
+
+    elif kind == "medium":
+        root.y = MEDIUM_Y
+        _cylinder(parent=root, color=OBSTACLE_COLORS["medium"],
+                  scale=(span, 0.55, 0.55), rotation=(0, 0, 90))
+        for bx in (-span * 0.32, 0, span * 0.32):
+            _cylinder(parent=root, color=color.rgb32(108, 64, 34),
+                      scale=(0.06, 0.57, 0.57), rotation=(0, 0, 90), position=(bx, 0, 0))
+        for cap_x in (-span * 0.48, span * 0.48):
+            _cylinder(parent=root, color=color.rgb32(100, 100, 108),
+                      scale=(0.12, 0.6, 0.6), rotation=(0, 0, 90), position=(cap_x, 0, 0))
+
+    else:  # "low"
+        root.y = LOW_Y
+        _cube(parent=root, color=OBSTACLE_COLORS["low"], scale=(span, 0.24, 0.3))
+        n_teeth = max(3, int(span / 0.3))
+        for i in range(n_teeth):
+            tx = -span / 2 + (i + 0.5) * (span / n_teeth)
+            if i % 2 == 0:
+                _cube(parent=root, color=color.rgb32(245, 245, 245),
+                      scale=(span / n_teeth * 0.55, 0.26, 0.05), position=(tx, 0, -0.16))
+        leg_h = LOW_Y  # legs reach from the ground up to the bar
+        for lx in (-span * 0.42, span * 0.42):
+            _cube(parent=root, color=color.rgb32(75, 75, 82),
+                  scale=(0.1, leg_h, 0.1), position=(lx, -LOW_Y + leg_h / 2, 0))
+
+    return root
+
+
+# Joint layout, bottom-up: legs hang from the hip, torso sits on top of
+# the legs, arms hang from the shoulder near the top of the torso.
+LEG_LENGTH = 0.55
+HIP_Y = LEG_LENGTH
+TORSO_HEIGHT = 0.7
+TORSO_CENTER_Y = HIP_Y + TORSO_HEIGHT / 2
+SHOULDER_Y = TORSO_CENTER_Y + TORSO_HEIGHT / 2 - 0.06
+ARM_LENGTH = 0.5
+HEAD_Y = TORSO_CENTER_Y + TORSO_HEIGHT / 2 + 0.22
+
+
+class PlayerRig(Entity):
+    """A small low-poly runner: head + torso + limbs, with a distinct
+    pose per action and a light idle stride animation while running.
+    Arms/legs are hung from fixed joint heights (shoulder/hip) using
+    _limb()'s top-pivoted cylinders, so rotating them swings from the
+    joint like a real hinge instead of flailing from the wrong end."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        body_color = color.rgb32(80, 200, 255)
+        shade_color = color.rgb32(40, 130, 175)
+
+        self.torso = _cube(parent=self, color=body_color,
+                            scale=(0.62, TORSO_HEIGHT, 0.4), y=TORSO_CENTER_Y)
+        self.head = Entity(parent=self, model="sphere", color=body_color, scale=0.42, y=HEAD_Y,
+                            shader=lit_with_shadows_shader)
+
+        self.left_arm = _limb(parent=self, color=shade_color, scale=(0.13, ARM_LENGTH, 0.13),
+                               position=(-0.38, SHOULDER_Y, 0))
+        self.right_arm = _limb(parent=self, color=shade_color, scale=(0.13, ARM_LENGTH, 0.13),
+                                position=(0.38, SHOULDER_Y, 0))
+        self.left_leg = _limb(parent=self, color=shade_color, scale=(0.16, LEG_LENGTH, 0.16),
+                               position=(-0.18, HIP_Y, 0))
+        self.right_leg = _limb(parent=self, color=shade_color, scale=(0.16, LEG_LENGTH, 0.16),
+                                position=(0.18, HIP_Y, 0))
+
+        self._t = 0.0
+        self.current_action = "run"
+
+    def update_pose(self, action, dt):
+        self._t += dt
+        self.current_action = action
+
+        if action == "duck":
+            self.torso.scale = (0.85, TORSO_HEIGHT * 0.55, 0.55)
+            self.torso.y = HIP_Y + TORSO_HEIGHT * 0.55 / 2
+            self.head.y = self.torso.y + TORSO_HEIGHT * 0.55 / 2 + 0.2
+            self.left_arm.rotation = (-100, 0, 0)
+            self.right_arm.rotation = (-100, 0, 0)
+            self.left_leg.rotation = (20, 0, 0)
+            self.right_leg.rotation = (-20, 0, 0)
+        elif action == "jump":
+            self.torso.scale = (0.62, TORSO_HEIGHT, 0.4)
+            self.torso.y = TORSO_CENTER_Y
+            self.head.y = HEAD_Y
+            self.left_arm.rotation = (-150, 0, 0)
+            self.right_arm.rotation = (-150, 0, 0)
+            self.left_leg.rotation = (55, 0, 0)
+            self.right_leg.rotation = (-55, 0, 0)
+        else:  # run -- opposite arm/leg pairs swing together (natural gait)
+            self.torso.scale = (0.62, TORSO_HEIGHT, 0.4)
+            self.torso.y = TORSO_CENTER_Y
+            self.head.y = HEAD_Y
+            swing = math.sin(self._t * 11.0) * 45
+            self.left_arm.rotation = (-swing, 0, 0)
+            self.right_arm.rotation = (swing, 0, 0)
+            self.left_leg.rotation = (swing, 0, 0)
+            self.right_leg.rotation = (-swing, 0, 0)

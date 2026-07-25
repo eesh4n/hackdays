@@ -1,7 +1,7 @@
 mediapipe==0.10.35
 opencv-contrib-python==5.0.0.93
 websockets==16.1.1
-pygame==2.6.1
+ursina==7.0.0
 
 # Do not separately `pip install opencv-python` -- it conflicts with the
 # opencv-contrib-python that mediapipe pulls in and breaks camera access.
