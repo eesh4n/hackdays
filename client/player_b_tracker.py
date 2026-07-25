@@ -683,7 +683,7 @@ class PlayerBTracker:
         lane_color = (120, 255, 120) if self.pose_visible else (120, 120, 255)
         cv2.putText(
             frame, f"lane (body position): {LANE_NAMES[self.lane].upper()}",
-            (20, 40 + len(self._slots) * 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, lane_color, 1, cv2.LINE_AA,
+            (20, 40 + len(self._slots) * 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, lane_color, 1, cv2.LINE_AA,
         )
 
         # Placement flashes -- colored to match the drop zone's type,
@@ -699,13 +699,12 @@ class PlayerBTracker:
         return frame
 
     def _draw_slot_status(self, frame, slot, row):
-        """One 3-line status block: primary action line (color-coded,
-        (20,40)-style position), secondary detail line (grey, smaller),
-        and a red "no hand" warning below when applicable -- exactly
-        Player A's layout, offset down per hand slot."""
+        """Primary action line (color-coded, (20,40)-style position) and a
+        red "no hand" warning below when applicable -- Player A's layout,
+        minus the numeric detail line, offset down per hand slot."""
         import cv2
 
-        base_y = 40 + row * 80
+        base_y = 40 + row * 50
 
         if slot.is_carrying:
             state, state_color = "CARRYING", STATE_COLOR_CARRYING
@@ -719,17 +718,9 @@ class PlayerBTracker:
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, state_color, 2, cv2.LINE_AA,
         )
 
-        cooldown_remaining = max(0.0, self.current_cooldown_sec - (time.time() - slot.last_placement_time))
-        conf_text = f"{slot.hand_confidence:.2f}" if slot.hand_confidence is not None else "--"
-        cv2.putText(
-            frame,
-            f"cooldown: {cooldown_remaining:.1f}s  confidence: {conf_text}  placements: {self.placement_count}",
-            (20, base_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA,
-        )
-
         if not slot.hand_visible:
             cv2.putText(
-                frame, f"No hand {slot.label} detected", (20, base_y + 40),
+                frame, f"No hand {slot.label} detected", (20, base_y + 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, NO_HAND_COLOR, 2, cv2.LINE_AA,
             )
 

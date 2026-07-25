@@ -86,8 +86,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     # DSHOW will often "accept" any FPS you request without validating the
     # hardware can actually deliver it -- this is a request, not a
-    # guarantee. Whether it did anything is only knowable from the live
-    # fps counter on screen, not from what cv2 reports back here.
+    # guarantee.
     cap.set(cv2.CAP_PROP_FPS, 60)
 
     tracker = PlayerBTracker()
@@ -107,26 +106,12 @@ def main():
     manual_lane = None
     manual_obstacle = None
 
-    # Rolling FPS counter -- measures the ACTUAL achieved rate so any
-    # tuning (resolution, pose-sample interval, etc.) can be judged against
-    # a real number instead of guessed at.
-    fps_frame_count = 0
-    fps_window_start = time.time()
-    current_fps = 0.0
-
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 print("[main] FAIL: camera frame read failed")
                 break
-
-            fps_frame_count += 1
-            fps_elapsed = time.time() - fps_window_start
-            if fps_elapsed >= 1.0:
-                current_fps = fps_frame_count / fps_elapsed
-                fps_frame_count = 0
-                fps_window_start = time.time()
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -180,10 +165,6 @@ def main():
             if manual_lane is not None or manual_obstacle is not None:
                 cv2.putText(frame, "MANUAL OVERRIDE", (right_x, frame.shape[0] - 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
-            fps_color = (0, 255, 0) if current_fps >= 20 else ((0, 165, 255) if current_fps >= 12 else (0, 0, 255))
-            cv2.putText(frame, f"fps: {current_fps:.1f}", (right_x, frame.shape[0] - 105),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, fps_color, 2)
 
             cv2.imshow(WINDOW_NAME, frame)
 
