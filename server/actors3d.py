@@ -45,7 +45,7 @@ LOW_Y = 0.35
 
 OBSTACLE_COLORS = {
     "high": color.rgb32(255, 176, 40),
-    "medium": color.rgb32(150, 92, 52),
+    "medium": color.rgb32(128, 126, 134),  # concrete-grey wall, not the old wooden-barrel brown
     "low": color.rgb32(224, 60, 60),
 }
 MEDIUM_WALL_HEIGHT = 0.55  # kept the same as the old barrel's diameter so

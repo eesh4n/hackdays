@@ -575,7 +575,10 @@ class Game:
                     sys.exit(0)
                 elif key in ("enter", "space") and game.intro_active and not game.intro_dismissing:
                     game._on_play_clicked()
-                elif key == "r" and game.game_over:
+                elif key == "r" and not game.intro_active:
+                    # A full reset at any time, not just after dying -- a
+                    # manual "restart the run" hotkey, useful mid-demo if
+                    # something needs restarting without waiting to lose.
                     game.reset()
                 elif key == "e":
                     # Stands in for Player B's real shield gesture -- goes
