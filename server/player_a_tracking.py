@@ -4,11 +4,15 @@ PLAYER A TRACKER (lane + jump/duck)
 
 PlayerATracker: feed frames in with process_frame(), poll .lane /
 .action / .pose_visible for live state each frame. This is the class
-server/main.py imports for the real game -- keep its process_frame()
-return shape ({"pose_visible", "lane", "action"}) in sync with
-player_a_tracker.py's if that ever changes.
+server/main.py imports for the real game -- its process_frame() return
+shape is {"pose_visible", "lane", "action"}.
 
-Lane: camera split into thirds by hip-center x-position.
+Lane: camera split into thirds by hip-center x position, with a
+hysteresis band at each boundary (same technique as
+client/player_b_tracker.py's lane detection) so standing near a boundary
+doesn't flicker the lane value between two frames -- this matters more
+here than on B's side, since A's lane is what collision detection
+actually checks every frame.
 Action ("run"/"jump"/"duck"): JumpDuckDetector (see jump_duck_detector.py)
 tracks hip_y relative to a self-calibrating baseline, normalized by the
 person's own torso length -- thresholds were derived from recorded
@@ -39,6 +43,13 @@ LANE_NAMES = ["LEFT", "CENTER", "RIGHT"]
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_WRIST, RIGHT_WRIST = 15, 16
 LEFT_HIP, RIGHT_HIP = 23, 24
+
+# Lane boundaries as a fraction of frame width, with a hysteresis band so
+# standing near a boundary doesn't flicker between two lanes every frame
+# -- same values/technique as client/player_b_tracker.py's lane detection.
+LANE_BOUNDARY_1 = 1 / 3
+LANE_BOUNDARY_2 = 2 / 3
+LANE_HYSTERESIS = 0.035
 
 DETECTOR_STATE_TO_ACTION = {"neutral": "run", "jump": "jump", "duck": "duck"}
 
@@ -149,9 +160,8 @@ class PlayerATracker:
             landmarks = result.pose_landmarks[0]  # first detected person
             self._last_landmarks = landmarks
 
-            lane_width = w / LANE_COUNT
-            hip_x = (landmarks[LEFT_HIP].x + landmarks[RIGHT_HIP].x) / 2 * w
-            self.lane = min(int(hip_x // lane_width), LANE_COUNT - 1)
+            hip_x_frac = (landmarks[LEFT_HIP].x + landmarks[RIGHT_HIP].x) / 2
+            self.lane = self._update_lane(hip_x_frac)
 
             hip_y = (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y) / 2
             shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2
@@ -176,6 +186,25 @@ class PlayerATracker:
             "lane": self.lane,
             "action": self.action,
         }
+
+    def _update_lane(self, hip_x_frac):
+        # Hysteresis: only cross a boundary if clearly past it relative to
+        # the lane already in, not just barely over the raw line -- avoids
+        # flickering the lane value (and therefore collision results)
+        # every frame for someone standing near a boundary.
+        b1_lo, b1_hi = LANE_BOUNDARY_1 - LANE_HYSTERESIS, LANE_BOUNDARY_1 + LANE_HYSTERESIS
+        b2_lo, b2_hi = LANE_BOUNDARY_2 - LANE_HYSTERESIS, LANE_BOUNDARY_2 + LANE_HYSTERESIS
+
+        if self.lane == 0:
+            return 1 if hip_x_frac > b1_hi else 0
+        elif self.lane == 1:
+            if hip_x_frac < b1_lo:
+                return 0
+            if hip_x_frac > b2_hi:
+                return 2
+            return 1
+        else:  # self.lane == 2
+            return 1 if hip_x_frac < b2_lo else 2
 
     def debug_overlay(self, frame):
         """Draws skeleton, lane dividers, and current lane/action onto a

@@ -129,11 +129,12 @@ COUNTDOWN_PULSE_DURATION = 0.15
 
 HUD_PANEL_COLOR = color.rgba32(20, 18, 30, 195)
 
-# Title screen -- "Rival" (red) slides in from the left, "Refs" (blue)
-# slides in from the right, they meet in the middle, and it all stays up
-# (with a PLAY button) until the player clicks it -- no auto-dismiss timer.
-# Shown exactly once at process start, not on restart (see Game.__init__
-# vs reset() -- reset() only ever (re)starts the countdown).
+# Title screen -- "Rival" (red) slides in from the left, "Runs" (blue)
+# slides in from the right, they meet in the middle to read "RivalRuns"
+# (the project's name), and it all stays up (with a PLAY button) until
+# the player clicks it -- no auto-dismiss timer. Shown exactly once at
+# process start, not on restart (see Game.__init__ vs reset() -- reset()
+# only ever (re)starts the countdown).
 INTRO_SLIDE_DURATION = 0.6
 INTRO_OFFSCREEN_OFFSET = 1.4
 INTRO_FADE_DURATION = 0.35  # only used for the click-to-dismiss transition now
@@ -483,16 +484,16 @@ class Game:
             scale=4.5, color=color.rgb32(255, 255, 255), background=True, enabled=False,
         )
 
-        # Title intro -- right-aligned "Rival" and left-aligned "Refs" butt
+        # Title intro -- right-aligned "Rival" and left-aligned "Runs" butt
         # up against the same center point (x=-0.01 / x=0.01) regardless of
         # each word's own text width, rather than needing to hand-measure
-        # pixel widths to butt them together.
+        # pixel widths to butt them together. Together they read "RivalRuns".
         self.intro_rival_text = Text(
             parent=camera.ui, text="Rival", origin=(0.5, 0), position=(-0.01, 0.05),
             scale=6.0, color=color.rgb32(230, 55, 55), font=HUD_FONT, enabled=False,
         )
         self.intro_refs_text = Text(
-            parent=camera.ui, text="Refs", origin=(-0.5, 0), position=(0.01, 0.05),
+            parent=camera.ui, text="Runs", origin=(-0.5, 0), position=(0.01, 0.05),
             scale=6.0, color=color.rgb32(70, 140, 235), font=HUD_FONT, enabled=False,
         )
         self.play_button = Button(

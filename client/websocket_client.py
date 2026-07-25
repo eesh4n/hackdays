@@ -8,20 +8,19 @@ Networking pattern validated in hackathon-prep/test_cross_laptop_websocket.py
 asyncio pattern so a synchronous camera loop can drive async networking).
 This adds the reconnect-on-drop logic neither test script needed to cover.
 
-The connection today is effectively one-way (B sends, the server never
-replies) -- but a WebSocket is full-duplex, so this client also runs a
-concurrent receive loop and will hand any incoming JSON message to an
-optional on_message callback. Right now nothing sends anything back, so
-this is inert -- but it's the missing piece that would let the host push
-e.g. {"event": "round_reset"} or a live score down to B, which today B has
-no way to find out about except a manual keypress. Wiring that up needs a
-small matching change server-side (websocket_server.py's handler would
-need to ws.send(...) something), which is out of scope for this file
-alone.
+The connection today is one-way in practice: this client only ever sends
+(_pump_send_queue below never reads from the socket), and the server
+never replies. A WebSocket is full-duplex, so a receive loop + an
+on_message callback would be a natural way to let the host push e.g.
+{"event": "round_reset"} or a live score down to B -- which today B has
+no way to find out about except a manual keypress -- but that doesn't
+exist yet. Adding it needs a matching change on both ends: a receive
+loop here, and websocket_server.py's handler actually calling
+ws.send(...) with something to receive.
 
 Usage from main.py (synchronous camera loop):
 
-    client = WebSocketClient(server_ip, port=8765, on_message=handle_msg)
+    client = WebSocketClient(server_ip, port=8765)
     client.start()
     ...
     client.send({"player": "B", "lane": 1, "obstacle": "high", ...})

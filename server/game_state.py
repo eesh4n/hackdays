@@ -1,18 +1,19 @@
 """
 Shared mutable state between the three concurrent loops running on Laptop 1:
 
-  - the pygame render loop (game.py), which reads this every frame
-  - the Player A camera thread (player_a_tracker.py via main.py), which
+  - the Ursina render loop (game.py), which reads this every frame
+  - the Player A camera thread (player_a_tracking.py via main.py), which
     writes lane/action every frame -- no network hop, so this is a plain
     threading.Lock rather than anything websocket-shaped
   - the websocket server thread (websocket_server.py), which writes a
-    spawn event every time Player B's punch gesture fires
+    spawn event every time Player B grabs and drops an obstacle, or a
+    shield-activation event on the "action": "shield" message
 
 Everything here is read/written from multiple threads, so every access
-goes through the same lock. Kept intentionally dumb (a struct + a queue)
-so game.py doesn't need to know anything about threads, mediapipe, or
-websockets -- it just calls get_player_a() and drain_spawn_events() once
-per frame.
+goes through the same lock. Kept intentionally dumb (a struct + a couple
+of queues) so game.py doesn't need to know anything about threads,
+mediapipe, or websockets -- it just calls get_player_a(),
+drain_spawn_events(), and drain_shield_requests() once per frame.
 """
 import threading
 import time

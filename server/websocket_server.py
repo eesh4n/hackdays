@@ -4,7 +4,7 @@ connection from Player B's laptop (client/websocket_client.py dials out
 to us) and writes every validated spawn event straight into GameState.
 
 Mirrors the client's threaded-asyncio pattern for the same reason: the
-pygame loop in game.py is a plain synchronous while-loop, so networking
+Ursina loop in game.py is a plain synchronous while-loop, so networking
 needs to live on its own thread with its own event loop rather than
 forcing the whole game onto asyncio.
 
