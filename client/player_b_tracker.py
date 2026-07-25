@@ -205,10 +205,40 @@ PLACEMENT_COOLDOWN_MAX_SEC = 0.9
 PLACEMENT_COOLDOWN_MIN_SEC = 0.5
 PLACEMENT_COOLDOWN_DECAY_PER_PLACEMENT = 0.006
 
-# Visual style constants for the (now two-handed) debug overlay.
-HAND_SLOT_COLORS = ((255, 210, 60), (255, 120, 220))  # per-slot marker tint (BGR), slot 0 / slot 1
-PANEL_BG_ALPHA = 0.55       # opacity of the dark status panel behind text
-PANEL_COLOR = (18, 18, 18)
+# Visual style: matches server/player_a_tracking.py's debug overlay exactly
+# (same colors, same font, same layout conventions) -- these two debug
+# windows are meant to be watched side by side, and having Player A's
+# skeleton view and Player B's hand view look like two unrelated tools
+# would be a needless inconsistency. All colors are BGR (cv2's order).
+BONE_COLOR = (0, 255, 136)      # green -- landmark connections
+LANDMARK_COLOR = (0, 0, 255)    # red -- individual landmark points
+LANE_DIVIDER_COLOR = (255, 255, 255)  # white
+ZONE_ACTIVE_LABEL_COLOR = (0, 255, 136)     # green, matches the active-zone tint
+ZONE_INACTIVE_LABEL_COLOR = (200, 200, 200)  # light grey
+ZONE_ACTIVE_TINT_ALPHA = 0.15
+
+# One fixed color per distinct hand state, reused everywhere that state is
+# shown -- mirrors Player A's jump/duck/block/run mapping. OPEN is the
+# neutral/idle state (like "run"), FIST is an active input just registered
+# (like "jump"), CARRYING is a held/special state (like "block"). No B
+# state maps to A's "duck" color -- there's no fourth distinct state to
+# assign it to, and inventing one just to use every color would be
+# arbitrary rather than meaningful.
+STATE_COLOR_OPEN = (0, 255, 136)      # green
+STATE_COLOR_FIST = (0, 200, 255)      # orange -- matches A's "jump"
+STATE_COLOR_CARRYING = (255, 0, 200)  # magenta -- matches A's "block"
+NO_HAND_COLOR = (0, 0, 255)           # red -- matches A's "No person detected"
+
+# MediaPipe Hand topology connections (21 landmarks) -- the hand-tracking
+# equivalent of Player A's POSE_CONNECTIONS subset, drawn the same way.
+HAND_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 4),        # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),        # index
+    (5, 9), (9, 10), (10, 11), (11, 12),   # middle
+    (9, 13), (13, 14), (14, 15), (15, 16),  # ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky
+    (0, 17),                                # palm base
+)
 
 
 class _HandSlot:
@@ -234,6 +264,7 @@ class _HandSlot:
         self.fist_closed = False
         self.hand_xy = None
         self.is_carrying = False
+        self.last_landmarks = None  # raw (unsmoothed) 21-point landmarks, for skeleton drawing
 
         # Brief visual "pop" at this slot's place location, purely cosmetic.
         self.place_flash_xy = None
@@ -426,6 +457,7 @@ class PlayerBTracker:
         slot.hand_visible = True
         slot.hand_confidence = confidence
         slot.hand_lost_since = None
+        slot.last_landmarks = lm
 
         raw_xy = _palm_center(lm)
         if slot.smoothed_palm_xy is None:
@@ -462,6 +494,7 @@ class PlayerBTracker:
         slot.fist_closed = False
         slot.fist_open_streak = 0
         slot.smoothed_palm_xy = None
+        slot.last_landmarks = None
 
         if slot.hand_lost_since is None:
             slot.hand_lost_since = now
@@ -569,65 +602,93 @@ class PlayerBTracker:
         return event
 
     def debug_overlay(self, frame):
-        """Draws the grab strip, the three drop zones, both hands' state,
-        and any placement flashes onto a BGR frame in place. Lane (from
-        body position, not hand position) is shown as text only -- it's a
-        different left/center/right axis than the drop zones and drawing
-        both as vertical dividers in the same space would be genuinely
-        confusing to look at. For the manual test window."""
+        """Draws both hands' skeletons, the grab/drop zones, and status
+        text onto a BGR frame in place -- same color/layout convention as
+        server/player_a_tracking.py's debug_overlay (bones, landmarks,
+        zone highlighting, status text all follow the identical scheme),
+        since the two debug windows are meant to be watched side by side.
+        For the manual test window."""
         import cv2
 
         h, w = frame.shape[:2]
         grab_h = int(h * GRAB_ZONE_HEIGHT_FRAC)
-        any_carrying = any(s.is_carrying for s in self._slots)
 
-        # Grab strip: one zone, full width, no type.
-        grab_color = (210, 210, 40) if any_carrying else (130, 130, 130)
-        cv2.rectangle(frame, (4, 4), (w - 4, grab_h - 4), grab_color, 3, cv2.LINE_AA)
-        _draw_text(frame, "GRAB HERE", (w // 2 - 78, grab_h - 14), 0.75, grab_color, thickness=2)
+        # Hand skeletons: same treatment as Player A's pose skeleton --
+        # green connection lines, red filled landmark points.
+        for slot in self._slots:
+            if slot.last_landmarks is None:
+                continue
+            points = [(int(p.x * w), int(p.y * h)) for p in slot.last_landmarks]
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(frame, points[a], points[b], BONE_COLOR, 2, cv2.LINE_AA)
+            for x, y in points:
+                cv2.circle(frame, (x, y), 4, LANDMARK_COLOR, -1, cv2.LINE_AA)
+            # Small identifying label at the wrist -- the skeleton itself
+            # carries no per-hand color (matching the "one fixed color per
+            # state, not per instance" principle), so this is the only cue
+            # for which physical hand is which when both are on screen.
+            wx, wy = points[WRIST]
+            cv2.putText(frame, slot.label, (wx + 14, wy), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # Drop zones: large, cover the rest of the frame.
+        # Zone active-state: a zone is "active" if any tracked hand is
+        # currently positioned in it -- shown live, regardless of whether
+        # that hand ends up actually grabbing/dropping there.
+        grab_active = any(
+            s.hand_visible and s.hand_xy is not None and self._in_grab_zone(s.hand_xy[1])
+            for s in self._slots
+        )
+        active_drop_types = {
+            self._drop_zone_at(*s.hand_xy)
+            for s in self._slots
+            if s.hand_visible and s.hand_xy is not None and self._drop_zone_at(*s.hand_xy) is not None
+        }
+
+        # Grab zone tint + divider + label -- same scheme as Player A's
+        # draw_lanes: soft green blend if active, white divider, label
+        # colored green (active) or grey (inactive) at the zone's bottom.
+        if grab_active:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, grab_h), ZONE_ACTIVE_LABEL_COLOR, -1)
+            cv2.addWeighted(overlay, ZONE_ACTIVE_TINT_ALPHA, frame, 1 - ZONE_ACTIVE_TINT_ALPHA, 0, dst=frame)
+        cv2.line(frame, (0, grab_h), (w, grab_h), LANE_DIVIDER_COLOR, 2, cv2.LINE_AA)
+        grab_label_color = ZONE_ACTIVE_LABEL_COLOR if grab_active else ZONE_INACTIVE_LABEL_COLOR
+        cv2.putText(frame, "GRAB", (w // 2 - 50, grab_h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, grab_label_color, 2, cv2.LINE_AA)
+
+        # Drop zones -- same scheme, one third-width zone per obstacle type.
         for i, obstacle_type in enumerate(DROP_TYPES_LEFT_TO_RIGHT):
-            x0, x1 = int(w * i / 3), int(w * (i + 1) / 3)
-            color = DROP_ZONE_COLORS[obstacle_type]
-            cv2.rectangle(frame, (x0 + 4, grab_h + 4), (x1 - 4, h - 4), color, 3, cv2.LINE_AA)
-            _draw_text(frame, obstacle_type.upper(), (x0 + 20, grab_h + 42), 0.85, color, thickness=2)
+            x0 = int(w * i / 3)
+            x1 = w if i == 2 else int(w * (i + 1) / 3)
+            if obstacle_type in active_drop_types:
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (x0, grab_h), (x1, h), ZONE_ACTIVE_LABEL_COLOR, -1)
+                cv2.addWeighted(overlay, ZONE_ACTIVE_TINT_ALPHA, frame, 1 - ZONE_ACTIVE_TINT_ALPHA, 0, dst=frame)
             if i > 0:
-                cv2.line(frame, (x0, grab_h), (x0, h), (90, 90, 90), 1, cv2.LINE_AA)
+                cv2.line(frame, (x0, grab_h), (x0, h), LANE_DIVIDER_COLOR, 2, cv2.LINE_AA)
+            label_color = ZONE_ACTIVE_LABEL_COLOR if obstacle_type in active_drop_types else ZONE_INACTIVE_LABEL_COLOR
+            cv2.putText(frame, obstacle_type.upper(), (x0 + 20, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, label_color, 2, cv2.LINE_AA)
 
-        # Status panel: one semi-transparent dark strip behind all the text
-        # rows, instead of raw text floating on top of whatever the camera
-        # sees -- legibility over any background, and it reads as a single
-        # deliberate UI element rather than debug prints scattered on video.
-        panel_top = h - 190
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (0, panel_top), (w, h), PANEL_COLOR, -1)
-        cv2.addWeighted(overlay, PANEL_BG_ALPHA, frame, 1 - PANEL_BG_ALPHA, 0, dst=frame)
+        # Status text, top-left, stacked -- one 3-line block per hand
+        # (primary state / secondary detail / no-hand warning), same
+        # positions and scale as Player A's single block, just repeated.
+        for row, slot in enumerate(self._slots):
+            self._draw_slot_status(frame, slot, row)
 
+        # Lane (body position, a different axis than the hand-driven drop
+        # zones above) doesn't correspond to any zone drawn on this screen,
+        # so it's a plain secondary-style readout rather than forced into
+        # the zone-label convention.
         lane_color = (120, 255, 120) if self.pose_visible else (120, 120, 255)
-        _draw_text(frame, f"LANE  {LANE_NAMES[self.lane].upper()}", (14, h - 158), 0.7, lane_color, thickness=2)
-
-        cooldown = self.current_cooldown_sec
-        _draw_text(
-            frame,
-            f"placements: {self.placement_count}   cooldown: {cooldown:.2f}s",
-            (14, h - 128), 0.55, (210, 210, 210), thickness=1,
+        cv2.putText(
+            frame, f"lane (body position): {LANE_NAMES[self.lane].upper()}",
+            (20, 40 + len(self._slots) * 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, lane_color, 1, cv2.LINE_AA,
         )
 
-        for row, slot in enumerate(self._slots):
-            self._draw_slot_status(frame, slot, row, h)
-
-        # Hand markers + placement flashes.
+        # Placement flashes -- colored to match the drop zone's type,
+        # confirming visually which type actually fired.
         for slot in self._slots:
-            color = HAND_SLOT_COLORS[int(slot.label) - 1]
-            if slot.hand_xy is not None:
-                hx, hy = slot.hand_xy
-                px, py = int(hx * w), int(hy * h)
-                ring_color = (0, 210, 255) if slot.is_carrying else (color if slot.fist_closed else (120, 255, 120))
-                cv2.circle(frame, (px, py), 16, ring_color, 3 if slot.fist_closed else 2, cv2.LINE_AA)
-                cv2.circle(frame, (px, py), 3, ring_color, -1, cv2.LINE_AA)
-                _draw_text(frame, slot.label, (px + 18, py + 6), 0.55, color, thickness=2)
-
             flash_age = time.time() - slot.place_flash_time
             if slot.place_flash_xy is not None and flash_age < 0.3:
                 fx, fy = slot.place_flash_xy
@@ -637,40 +698,40 @@ class PlayerBTracker:
 
         return frame
 
-    def _draw_slot_status(self, frame, slot, row, h):
+    def _draw_slot_status(self, frame, slot, row):
+        """One 3-line status block: primary action line (color-coded,
+        (20,40)-style position), secondary detail line (grey, smaller),
+        and a red "no hand" warning below when applicable -- exactly
+        Player A's layout, offset down per hand slot."""
         import cv2
 
-        color = HAND_SLOT_COLORS[int(slot.label) - 1]
-        y = h - 96 + row * 44
+        base_y = 40 + row * 80
 
-        if not slot.hand_visible:
-            state_text, state_color = "no hand", (120, 120, 255)
-        elif slot.is_carrying:
-            state_text, state_color = "carrying -- find a drop zone", (0, 215, 255)
+        if slot.is_carrying:
+            state, state_color = "CARRYING", STATE_COLOR_CARRYING
         elif slot.fist_closed:
-            state_text, state_color = "fist (grab in the top strip)", (120, 190, 255)
+            state, state_color = "FIST", STATE_COLOR_FIST
         else:
-            state_text, state_color = "open", (120, 255, 120)
+            state, state_color = "OPEN", STATE_COLOR_OPEN
 
-        cooldown_remaining = max(0.0, self.current_cooldown_sec - (time.time() - slot.last_placement_time))
-        ready_text = "ready" if cooldown_remaining <= 0 else f"cooldown {cooldown_remaining:.1f}s"
-        conf_text = f"{slot.hand_confidence:.2f}" if slot.hand_confidence is not None else "--"
-
-        _draw_text(frame, f"HAND {slot.label}", (14, y), 0.6, color, thickness=2)
-        _draw_text(
-            frame, f"{state_text}  |  {ready_text}  |  conf {conf_text}",
-            (108, y), 0.52, state_color, thickness=1,
+        cv2.putText(
+            frame, f"hand {slot.label}: {state}", (20, base_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.0, state_color, 2, cv2.LINE_AA,
         )
 
+        cooldown_remaining = max(0.0, self.current_cooldown_sec - (time.time() - slot.last_placement_time))
+        conf_text = f"{slot.hand_confidence:.2f}" if slot.hand_confidence is not None else "--"
+        cv2.putText(
+            frame,
+            f"cooldown: {cooldown_remaining:.1f}s  confidence: {conf_text}  placements: {self.placement_count}",
+            (20, base_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA,
+        )
 
-def _draw_text(frame, text, pos, scale, color, thickness=1):
-    """cv2.putText with a black outline underneath -- keeps text legible
-    over live, unpredictable camera video (a bright window, skin tone,
-    clothing) that a flat color alone won't reliably contrast against."""
-    import cv2
-
-    cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-    cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+        if not slot.hand_visible:
+            cv2.putText(
+                frame, f"No hand {slot.label} detected", (20, base_y + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, NO_HAND_COLOR, 2, cv2.LINE_AA,
+            )
 
 
 def _dist(a, b):
