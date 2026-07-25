@@ -112,10 +112,9 @@ POSE_SAMPLE_EVERY_N_FRAMES = 8  # lane only needs occasional updates, not every 
 # player is standing from the camera -- a fixed raw-coordinate threshold
 # would be too tight up close and too loose far away, the same distance-
 # invariance problem that bit the old punch thresholds.
-MAX_LOCK_JUMP_FRAC = 1.6  # raised from 1.0 -- a genuinely fast reach/swipe between two 33ms
-                          # frames could plausibly exceed one shoulder-width, and being
-                          # rejected as "a different hand" mid-gesture is worse than
-                          # occasionally being too lenient about what counts as the same hand
+MAX_LOCK_JUMP_FRAC = 2.2  # raised again from 1.6 -- being rejected as "a different hand"
+                          # mid-gesture is worse than occasionally being too lenient about
+                          # what counts as the same hand
 DEFAULT_SHOULDER_WIDTH = 0.15  # fallback before pose has sampled even once
 
 # If a tracked hand goes fully undetected for this long, drop whatever it
@@ -129,14 +128,14 @@ HAND_LOST_CANCEL_CARRY_SEC = 0.6
 HAND_LOST_FORGET_LOCK_SEC = 1.0
 
 # The fist-closed reading is a coarse per-frame heuristic and can flicker
-# for a single frame even mid-gesture. Requiring it to read "open"/"closed"
-# for this many consecutive frames before treating either as real stops
-# one noisy frame from silently cancelling an entire carry (OPEN) or
-# triggering an accidental grab just from passing a hand through the
-# strip (CLOSE) -- same root cause (a single-frame misread), so both
-# directions get the same debounce, not just the one that was reported.
-OPEN_DEBOUNCE_FRAMES = 2
-CLOSE_DEBOUNCE_FRAMES = 2
+# for a single frame even mid-gesture -- these debounce counts were 2/2 to
+# guard against that, at the cost of a small delay before a grab/release
+# is accepted. Lowered to 1 (effectively no debounce, especially for
+# OPEN/release) to prioritize immediate responsiveness -- if releases
+# start firing on a single noisy frame mid-carry, raise OPEN_DEBOUNCE_FRAMES
+# back toward 2 rather than tolerating dropped carries.
+OPEN_DEBOUNCE_FRAMES = 1
+CLOSE_DEBOUNCE_FRAMES = 1
 
 # Detections below this confidence are discarded before they ever reach the
 # lock/fist logic -- a low-confidence detection is often a half-occluded
@@ -146,7 +145,7 @@ CLOSE_DEBOUNCE_FRAMES = 2
 # out to reject far too many genuinely-fine detections in practice --
 # lowered until proven otherwise by the on-screen confidence readout
 # (see debug_overlay) rather than guessed again blind.
-HAND_MIN_CONFIDENCE = 0.2
+HAND_MIN_CONFIDENCE = 0.12
 
 # Exponential smoothing on each tracked palm position (0 < alpha <= 1;
 # higher = less smoothing, more responsive). Raw per-frame landmark
