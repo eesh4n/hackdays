@@ -43,10 +43,10 @@ def parse_args():
 def run_camera_tracker(game_state, camera_index, stop_event):
     """Runs on its own thread: opens the webcam, feeds frames to
     PlayerATracker, and writes the result straight into GameState every
-    frame. Imports cv2/player_a_tracker lazily so --no-camera can run on a
+    frame. Imports cv2/player_a_tracking lazily so --no-camera can run on a
     machine without opencv/mediapipe/the pose model installed at all."""
     import cv2
-    from player_a_tracker import PlayerATracker
+    from player_a_tracking import PlayerATracker
 
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
