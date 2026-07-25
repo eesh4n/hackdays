@@ -28,7 +28,7 @@ import random
 import sys
 
 from ursina import (
-    Ursina, Entity, Text, Sky, DirectionalLight, AmbientLight,
+    Ursina, Entity, Text, Button, Sky, DirectionalLight, AmbientLight,
     color, held_keys, destroy, curve, camera, window, application, invoke, Vec3,
     time as ursina_time,
 )
@@ -122,6 +122,15 @@ COUNTDOWN_PULSE_SCALE = 1.3
 COUNTDOWN_PULSE_DURATION = 0.15
 
 HUD_PANEL_COLOR = color.rgba32(20, 18, 30, 195)
+
+# Title screen -- "Rival" (red) slides in from the left, "Refs" (blue)
+# slides in from the right, they meet in the middle, and it all stays up
+# (with a PLAY button) until the player clicks it -- no auto-dismiss timer.
+# Shown exactly once at process start, not on restart (see Game.__init__
+# vs reset() -- reset() only ever (re)starts the countdown).
+INTRO_SLIDE_DURATION = 0.6
+INTRO_OFFSCREEN_OFFSET = 1.4
+INTRO_FADE_DURATION = 0.35  # only used for the click-to-dismiss transition now
 
 # Countdown before each run starts (also on restart after game over). This
 # isn't just cosmetic: PlayerATracker's JumpDuckDetector spends its first
@@ -286,6 +295,8 @@ class Game:
         self.best_score = 0.0  # persists across reset() -- a run's own high-water mark
 
         self.reset()
+        self._start_intro()  # overrides reset()'s countdown_active=True -- intro plays first,
+                              # exactly once at process start, not on every restart
 
         application.trace = False
 
@@ -433,14 +444,6 @@ class Game:
             parent=camera.ui, text="TRACKING LOST", position=(-0.85, -0.46), scale=0.9,
             color=color.rgb32(255, 120, 120), background=True, enabled=False, font=HUD_FONT,
         )
-        # Positioned below the shared HUD panel (which ends around y=0.16)
-        # rather than at the original y=0.27, which used to land right on
-        # top of the shield text/bar added alongside it.
-        self.jump_duck_debug_text = Text(
-            parent=camera.ui, text="", position=(-0.85, 0.15), scale=0.9,
-            color=color.rgb32(180, 180, 190), background=True,
-        )
-
         self.gameover_text = Text(
             parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.2),
             scale=3.6, color=color.rgb32(255, 80, 80), enabled=False, font=HUD_FONT,
@@ -462,6 +465,26 @@ class Game:
             parent=camera.ui, text="", origin=(0, 0), position=(0, 0.1),
             scale=4.5, color=color.rgb32(255, 255, 255), background=True, enabled=False,
         )
+
+        # Title intro -- right-aligned "Rival" and left-aligned "Refs" butt
+        # up against the same center point (x=-0.01 / x=0.01) regardless of
+        # each word's own text width, rather than needing to hand-measure
+        # pixel widths to butt them together.
+        self.intro_rival_text = Text(
+            parent=camera.ui, text="Rival", origin=(0.5, 0), position=(-0.01, 0.05),
+            scale=6.0, color=color.rgb32(230, 55, 55), font=HUD_FONT, enabled=False,
+        )
+        self.intro_refs_text = Text(
+            parent=camera.ui, text="Refs", origin=(-0.5, 0), position=(0.01, 0.05),
+            scale=6.0, color=color.rgb32(70, 140, 235), font=HUD_FONT, enabled=False,
+        )
+        self.play_button = Button(
+            text="PLAY", parent=camera.ui, position=(0, -0.22), scale=(0.22, 0.09),
+            color=color.rgb32(70, 140, 235), highlight_color=color.rgb32(90, 165, 255),
+            pressed_color=color.rgb32(55, 115, 200), text_size=1.6, enabled=False,
+        )
+        self.play_button.text_entity.font = HUD_FONT
+        self.play_button.on_click = self._on_play_clicked
 
     def _spawn_pickup_popup(self, text, popup_color):
         """A floating "+N" that pops up above the coins counter and fades
@@ -521,7 +544,9 @@ class Game:
                 if game.keyboard_fallback:
                     game._apply_keyboard_fallback()
                 dt = ursina_time.dt
-                if game.countdown_active:
+                if game.intro_active:
+                    game.update_intro(dt)
+                elif game.countdown_active:
                     game.update_countdown(dt)
                 elif not game.game_over:
                     game.update(dt)
@@ -531,6 +556,8 @@ class Game:
                 if key in ("escape", "q"):
                     application.quit()
                     sys.exit(0)
+                elif key in ("enter", "space") and game.intro_active and not game.intro_dismissing:
+                    game._on_play_clicked()
                 elif key == "r" and game.game_over:
                     game.reset()
                 elif key == "e":
@@ -565,6 +592,65 @@ class Game:
         self.game_state.set_player_a(self._kb_lane, action, pose_visible=True)
 
     # --- per-frame logic ---------------------------------------------------
+
+    def _start_intro(self):
+        self.intro_active = True
+        self.intro_dismissing = False
+        self.intro_elapsed = 0.0
+        self.countdown_active = False
+        self.countdown_text.enabled = False
+
+        self.intro_rival_text.x = -0.01 - INTRO_OFFSCREEN_OFFSET
+        self.intro_refs_text.x = 0.01 + INTRO_OFFSCREEN_OFFSET
+        self.intro_rival_text.color = color.rgba32(230, 55, 55, 255)
+        self.intro_refs_text.color = color.rgba32(70, 140, 235, 255)
+        self.intro_rival_text.enabled = True
+        self.intro_refs_text.enabled = True
+        self.intro_rival_text.animate_x(-0.01, duration=INTRO_SLIDE_DURATION, curve=curve.out_expo)
+        self.intro_refs_text.animate_x(0.01, duration=INTRO_SLIDE_DURATION, curve=curve.out_expo)
+
+        self.play_button.color = color.rgb32(70, 140, 235)
+        self.play_button.enabled = True
+
+    def _on_play_clicked(self):
+        """PLAY was clicked -- the title stays up (per the request: "the
+        game name exists until the user clicks play") until this fires,
+        no auto-dismiss timer. Fades the title out, then hands off to the
+        countdown once the fade finishes."""
+        if self.intro_dismissing:
+            return  # ignore a double-click mid-transition
+        self.intro_dismissing = True
+        self.intro_elapsed = 0.0
+        self.play_button.enabled = False
+
+    def update_intro(self, dt):
+        """Runs instead of update()/update_countdown() during the title
+        screen. Camera/scenery/player still animate in the background
+        (same idea as update_countdown) so it doesn't feel like a static
+        splash screen slapped on top of a frozen game."""
+        self.game_state.drain_spawn_events()
+        self._lane_a, self._action_a, self._pose_visible_a = self.game_state.get_player_a()
+        self._update_player(dt)
+        self._update_camera(dt)
+        self._update_scenery()
+
+        if not self.intro_dismissing:
+            return  # title stays up indefinitely until PLAY is clicked
+
+        self.intro_elapsed += dt
+        t = min(1.0, self.intro_elapsed / INTRO_FADE_DURATION)
+        alpha = int(255 * (1 - t))
+        self.intro_rival_text.color = color.rgba32(230, 55, 55, alpha)
+        self.intro_refs_text.color = color.rgba32(70, 140, 235, alpha)
+
+        if self.intro_elapsed >= INTRO_FADE_DURATION:
+            self.intro_active = False
+            self.intro_rival_text.enabled = False
+            self.intro_refs_text.enabled = False
+            self.countdown_active = True
+            self.countdown_remaining = COUNTDOWN_SECONDS
+            self.countdown_text.text = str(math.ceil(COUNTDOWN_SECONDS))
+            self.countdown_text.enabled = True
 
     def update_countdown(self, dt):
         """Runs instead of update() while the "Get Ready" countdown is up.
@@ -724,7 +810,7 @@ class Game:
                     self.coins_collected += 1
                     self.total_coins_collected += 1
                     self.score += COIN_SCORE_VALUE
-                    self._spawn_pickup_popup(f"+{COIN_SCORE_VALUE}", color.rgb32(255, 210, 60))
+                    self._spawn_pickup_popup(f"+{COIN_SCORE_VALUE}", color.rgb32(255, 255, 255))
                     coin.destroy()
                     continue
 
@@ -828,11 +914,6 @@ class Game:
             self.shield_bar_fill.scale_x = max(0.001, SHIELD_BAR_WIDTH * pct)
         self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
-
-        delta, jump_threshold, duck_threshold = self.game_state.get_player_a_debug()
-        self.jump_duck_debug_text.text = (
-            f"delta: {delta:+.2f}  (jump<-{jump_threshold:.2f}  duck>{duck_threshold:.2f})"
-        )
 
     def _show_game_over(self):
         self.gameover_text.enabled = True
