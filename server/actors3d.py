@@ -43,6 +43,10 @@ OBSTACLE_COLORS = {
     "low": color.rgb32(224, 60, 60),
 }
 
+COIN_Y = 1.0
+COIN_COLOR = color.rgb32(255, 210, 60)
+COIN_RIM_COLOR = color.rgb32(205, 150, 20)
+
 
 def _cube(**kwargs):
     kwargs.setdefault("model", "cube")
@@ -110,6 +114,20 @@ def build_obstacle(kind, lane_width):
             _cube(parent=root, color=color.rgb32(75, 75, 82),
                   scale=(0.1, leg_h, 0.1), position=(lx, -LOW_Y + leg_h / 2, 0))
 
+    return root
+
+
+def build_coin():
+    """A flat gold disc standing upright, facing the player -- spins
+    around its own vertical axis in game.py for the classic
+    face-to-edge-to-face "spinning coin" look."""
+    root = Entity()
+    # scale=(x, y, z): built as a flat puck (thin along y, radius in x/z),
+    # then tipped 90 degrees around x so the flat faces point along z
+    # (toward the player) instead of up/down.
+    _cylinder(parent=root, color=COIN_COLOR, scale=(0.5, 0.12, 0.5), rotation=(90, 0, 0))
+    _cylinder(parent=root, color=COIN_RIM_COLOR, scale=(0.56, 0.05, 0.56), rotation=(90, 0, 0))
+    root.y = COIN_Y
     return root
 
 

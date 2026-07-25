@@ -22,6 +22,7 @@ different action clears it:
     "low"    a ground-level hurdle
              -> avoided only by JUMP (ducking would put you into it)
 """
+import math
 import random
 import sys
 
@@ -41,20 +42,21 @@ Z_NEAR = 0.0
 Z_FAR = 34.0
 OBSTACLE_WORLD_SPEED_START = 7.0    # world units/sec, how fast z decreases
 OBSTACLE_WORLD_SPEED_RAMP = 0.22    # added per second survived
-COLLISION_Z_BAND = 1.1              # world-units window around Z_NEAR to check a hit
 
 LANE_LERP_DURATION = 0.16
 JUMP_HEIGHT = 1.7
 JUMP_DURATION = 0.5
 DUCK_HOLD = 0.0  # duck pose handled every frame by PlayerRig.update_pose, no tween needed
 
-CAMERA_BACK_OFFSET = 7.5
+CAMERA_FOV = 78              # vertical fov, tuned/approved on a landscape window
+CAMERA_BACK_OFFSET = 7.5     # landscape baseline/floor -- see camera_back_offset_for()
 CAMERA_HEIGHT = 3.4
 CAMERA_LANE_LERP = 6.0  # how eagerly the chase camera follows the player's lane
-
-# Obstacles must clear the camera itself (not just the player) before being
-# destroyed, or they visibly pop out of existence while still on screen.
-REMOVE_Z = -(CAMERA_BACK_OFFSET + 2.5)
+REMOVE_Z_MARGIN = 2.5   # obstacles/coins must clear the camera itself (not just the
+                        # player) before being destroyed, or they visibly pop out of
+                        # existence while still on screen -- see Game._build_scene(),
+                        # which computes self.remove_z from the actual per-session
+                        # camera distance (aspect-dependent, see camera_back_offset_for)
 
 TIE_COUNT = 16
 TIE_SPACING_Z = 2.2
@@ -65,6 +67,11 @@ BUILDING_COUNT = 22
 BUILDING_MIN_DIST = 55
 BUILDING_MAX_DIST = 110
 STAR_COUNT = 60
+
+COIN_SPAWN_INTERVAL_MIN = 1.1
+COIN_SPAWN_INTERVAL_MAX = 2.2
+COIN_SCORE_VALUE = 25
+COIN_SPIN_SPEED = 220  # degrees/sec
 
 SKY_COLOR = color.rgb32(20, 15, 40)
 GROUND_COLOR = color.rgb32(30, 28, 40)
@@ -82,6 +89,24 @@ STAR_COLOR = color.rgba32(230, 230, 255, 210)
 PLAYER_GLOW_COLOR = color.rgba32(80, 200, 255, 40)
 
 
+def camera_back_offset_for(aspect_ratio):
+    """Distance behind the player the chase camera sits. Keeps camera.fov
+    fixed at its already-tuned landscape value (CAMERA_FOV) and instead
+    pulls the camera back further on a narrower/portrait aspect ratio, so
+    the full 3-lane track width stays framed -- rather than cranking fov
+    itself to an extreme value, which would look fisheye-distorted on a
+    tall monitor (preserving the exact landscape horizontal fov on a 9:16
+    portrait aspect works out to a ~137 degree vertical fov, checked by
+    hand -- too extreme to be worth it). Landscape aspect ratios get
+    exactly the original fixed offset back (max() with the floor), so the
+    already-tuned landscape camera is untouched by this change.
+    """
+    half_v = math.radians(CAMERA_FOV / 2)
+    half_h = math.atan(math.tan(half_v) * aspect_ratio)
+    half_width_needed = (LANE_WIDTH * LANE_COUNT) / 2 + 1.2  # track half-width + margin
+    return max(CAMERA_BACK_OFFSET, half_width_needed / math.tan(half_h))
+
+
 def avoided(action, obstacle_kind):
     if obstacle_kind == "high":
         return action == "duck"
@@ -97,7 +122,7 @@ def lane_x(lane):
 
 
 class Obstacle:
-    __slots__ = ("lane", "kind", "z", "entity")
+    __slots__ = ("lane", "kind", "z", "entity", "resolved")
 
     def __init__(self, lane, kind):
         self.lane = lane
@@ -106,9 +131,32 @@ class Obstacle:
         self.entity = actors3d.build_obstacle(kind, LANE_WIDTH)
         self.entity.x = lane_x(lane)
         self.entity.z = self.z
+        self.resolved = False  # has this obstacle already had its hit/avoid check?
 
     def sync_transform(self):
         self.entity.z = self.z
+
+    def destroy(self):
+        destroy(self.entity)
+
+
+class Coin:
+    """A collectible spawned by the game itself (not placed by Player B)
+    -- picked up just by being in the right lane when it arrives,
+    regardless of jump/duck, same as a real endless runner."""
+    __slots__ = ("lane", "z", "entity", "resolved")
+
+    def __init__(self, lane):
+        self.lane = lane
+        self.z = Z_FAR
+        self.entity = actors3d.build_coin()
+        self.entity.x = lane_x(lane)
+        self.entity.z = self.z
+        self.resolved = False
+
+    def sync_transform(self, dt):
+        self.entity.z = self.z
+        self.entity.rotation_y += COIN_SPIN_SPEED * dt
 
     def destroy(self):
         destroy(self.entity)
@@ -215,13 +263,24 @@ class Game:
         self._glow = Entity(model="circle", color=PLAYER_GLOW_COLOR, rotation_x=90,
                              scale=LANE_WIDTH * 0.95, y=0.02)
 
-        camera.fov = 78
+        # window.aspect_ratio reflects the real fullscreen resolution at this
+        # point (native, whatever orientation the monitor/OS is set to) --
+        # not a fixed assumption of landscape. fov itself stays fixed; only
+        # the camera distance adapts (see camera_back_offset_for's docstring
+        # for why deriving fov directly was rejected -- fisheye risk).
+        camera.fov = CAMERA_FOV
+        self.camera_back_offset = camera_back_offset_for(window.aspect_ratio)
+        self.remove_z = -(self.camera_back_offset + REMOVE_Z_MARGIN)
         self._camera_x = lane_x(1)
 
     def _build_hud(self):
         self.score_text = Text(
             parent=camera.ui, text="Score: 0", position=(-0.85, 0.45), scale=1.6,
             color=color.rgb32(235, 235, 240), background=True,
+        )
+        self.coins_text = Text(
+            parent=camera.ui, text="Coins: 0", position=(-0.85, 0.39), scale=1.2,
+            color=color.rgb32(255, 210, 60), background=True,
         )
         self.warn_text = Text(
             parent=camera.ui, text="Player A pose not detected -- using last known state",
@@ -242,6 +301,11 @@ class Game:
         for obstacle in getattr(self, "obstacles", []):
             obstacle.destroy()
         self.obstacles = []
+        for coin in getattr(self, "coins", []):
+            coin.destroy()
+        self.coins = []
+        self.coins_collected = 0
+        self._next_coin_spawn = random.uniform(COIN_SPAWN_INTERVAL_MIN, COIN_SPAWN_INTERVAL_MAX)
         self.score = 0.0
         self.survived_sec = 0.0
         self.game_over = False
@@ -303,25 +367,66 @@ class Game:
 
         still_alive = []
         for obstacle in self.obstacles:
+            prev_z = obstacle.z
             obstacle.z -= speed * dt
-            obstacle.sync_transform()
 
-            if abs(obstacle.z - Z_NEAR) <= COLLISION_Z_BAND and obstacle.lane == self._lane_a:
-                if not avoided(self._action_a, obstacle.kind):
+            # Exact zero-crossing, not a wide "am I near" band -- fires exactly
+            # once, the instant the obstacle reaches the player, regardless of
+            # frame rate/speed (prev_z was still in front, new z is at/behind).
+            # A band-based check could freeze the game-over frame with the
+            # obstacle already deep inside the player model; snapping it to
+            # Z_NEAR here means a hit always freezes on a clean contact pose.
+            if not obstacle.resolved and prev_z > Z_NEAR >= obstacle.z:
+                obstacle.resolved = True
+                if obstacle.lane == self._lane_a and not avoided(self._action_a, obstacle.kind):
+                    obstacle.z = Z_NEAR
                     self.game_over = True
 
-            if obstacle.z > REMOVE_Z:
+            obstacle.sync_transform()
+
+            if obstacle.z > self.remove_z:
                 still_alive.append(obstacle)
             else:
                 obstacle.destroy()
         self.obstacles = still_alive
 
+        self._update_coins(dt, speed)
         self._update_player(dt)
         self._update_camera(dt)
         self._update_scenery()
 
         if self.game_over:
             self._show_game_over()
+
+    def _update_coins(self, dt, speed):
+        self._next_coin_spawn -= dt
+        if self._next_coin_spawn <= 0:
+            self._next_coin_spawn = random.uniform(COIN_SPAWN_INTERVAL_MIN, COIN_SPAWN_INTERVAL_MAX)
+            self.coins.append(Coin(random.randint(0, LANE_COUNT - 1)))
+
+        still_alive = []
+        for coin in self.coins:
+            prev_z = coin.z
+            coin.z -= speed * dt
+
+            # Same exact-crossing approach as obstacles: collect the instant
+            # the coin reaches the player, in whichever lane they're in --
+            # unlike obstacles, no action is required, just being in lane.
+            if not coin.resolved and prev_z > Z_NEAR >= coin.z:
+                coin.resolved = True
+                if coin.lane == self._lane_a:
+                    self.coins_collected += 1
+                    self.score += COIN_SCORE_VALUE
+                    coin.destroy()
+                    continue
+
+            coin.sync_transform(dt)
+
+            if coin.z > self.remove_z:
+                still_alive.append(coin)
+            else:
+                coin.destroy()
+        self.coins = still_alive
 
     def _update_player(self, dt):
         target_x = lane_x(self._lane_a)
@@ -345,7 +450,7 @@ class Game:
     def _update_camera(self, dt):
         target_x = lane_x(self._lane_a)
         self._camera_x += (target_x - self._camera_x) * min(1, CAMERA_LANE_LERP * dt)
-        camera.position = (self._camera_x, CAMERA_HEIGHT, -CAMERA_BACK_OFFSET)
+        camera.position = (self._camera_x, CAMERA_HEIGHT, -self.camera_back_offset)
         camera.look_at((target_x, 1.1, 12))
 
     def _update_scenery(self):
@@ -367,6 +472,7 @@ class Game:
 
     def draw(self):
         self.score_text.text = f"Score: {int(self.score)}"
+        self.coins_text.text = f"Coins: {self.coins_collected}"
         self.warn_text.enabled = not self._pose_visible_a
 
     def _show_game_over(self):
