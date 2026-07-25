@@ -34,7 +34,11 @@ from ursina.models.procedural.cylinder import Cylinder
 from ursina.shaders import lit_with_shadows_shader
 
 HIGH_Y = 2.05
-MEDIUM_Y = 1.05
+MEDIUM_Y = 1.35  # raised from 1.05 -- at 1.05 the barrel's bottom edge
+                 # (0.775) actually overlapped the ducked torso's top edge
+                 # (0.935), so a "successfully avoided" duck still visibly
+                 # clipped through the barrel. See update_pose()'s "duck"
+                 # branch for the matching squash-depth fix.
 LOW_Y = 0.35
 
 OBSTACLE_COLORS = {
@@ -184,9 +188,13 @@ class PlayerRig(Entity):
             self.left_leg.rotation = (0, 0, 0)
             self.right_leg.rotation = (0, 0, 0)
         elif action == "duck":
-            self.torso.scale = (0.85, TORSO_HEIGHT * 0.55, 0.55)
-            self.torso.y = HIP_Y + TORSO_HEIGHT * 0.55 / 2
-            self.head.y = self.torso.y + TORSO_HEIGHT * 0.55 / 2 + 0.2
+            # 0.4 (was 0.55) -- at 0.55 the ducked torso's top edge (0.935)
+            # still overlapped the medium obstacle's bottom edge (0.775 at
+            # the old MEDIUM_Y), so a duck that correctly avoided the hit
+            # per the rule table still visibly clipped through the barrel.
+            self.torso.scale = (0.85, TORSO_HEIGHT * 0.4, 0.55)
+            self.torso.y = HIP_Y + TORSO_HEIGHT * 0.4 / 2
+            self.head.y = self.torso.y + TORSO_HEIGHT * 0.4 / 2 + 0.2
             self.left_arm.rotation = (-100, 0, 0)
             self.right_arm.rotation = (-100, 0, 0)
             self.left_leg.rotation = (20, 0, 0)

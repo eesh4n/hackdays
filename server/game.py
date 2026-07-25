@@ -109,6 +109,19 @@ SHIELD_DURATION_SEC = 2.0  # a shield lasts a fixed 2s once activated,
                            # regardless of how many hits it absorbs during
                            # that window -- not consumed by use
 SHIELD_COLOR = color.rgba32(120, 220, 255, 90)
+SHIELD_BAR_WIDTH = 0.26
+
+# UI feedback: a floating "+N" on every coin pickup, a brief full-screen
+# color flash on shield activation, and a quick scale-pop on each
+# countdown digit change -- all driven by Ursina's animate_* scheduling
+# so they play out over several frames without needing their own
+# per-frame bookkeeping in update()/draw().
+PICKUP_POPUP_DURATION = 0.6
+SHIELD_FLASH_DURATION = 0.4
+COUNTDOWN_PULSE_SCALE = 1.3
+COUNTDOWN_PULSE_DURATION = 0.15
+
+HUD_PANEL_COLOR = color.rgba32(20, 18, 30, 195)
 
 # Countdown before each run starts (also on restart after game over). This
 # isn't just cosmetic: PlayerATracker's JumpDuckDetector spends its first
@@ -270,6 +283,7 @@ class Game:
         self._pose_visible_a = False
         self._last_lane_a = 1
         self._last_action_a = None
+        self.best_score = 0.0  # persists across reset() -- a run's own high-water mark
 
         self.reset()
 
@@ -388,36 +402,81 @@ class Game:
         self._camera_x = lane_x(1)
 
     def _build_hud(self):
+        # One shared panel behind score/best/coins/shield instead of each
+        # having its own separate auto-sized chip -- reads as a single HUD
+        # block instead of three disconnected floating boxes.
+        self._hud_panel = Entity(parent=camera.ui, model="quad", color=HUD_PANEL_COLOR,
+                                  scale=(0.62, 0.32), position=(-0.55, 0.325), origin=(0, 0))
+
         self.score_text = Text(
             parent=camera.ui, text="SCORE: 0", position=(-0.85, 0.45), scale=1.8,
-            color=color.rgb32(235, 235, 240), background=True, font=HUD_FONT,
+            color=color.rgb32(235, 235, 240), font=HUD_FONT,
+        )
+        self.best_text = Text(
+            parent=camera.ui, text="BEST: 0", position=(-0.85, 0.405), scale=1.0,
+            color=color.rgb32(180, 178, 190), font=HUD_FONT,
         )
         self.coins_text = Text(
-            parent=camera.ui, text="COINS: 0", position=(-0.85, 0.39), scale=1.35,
-            color=color.rgb32(255, 210, 60), background=True, font=HUD_FONT,
+            parent=camera.ui, text="COINS: 0", position=(-0.85, 0.335), scale=1.35,
+            color=color.rgb32(255, 210, 60), font=HUD_FONT,
         )
         self.shield_text = Text(
-            parent=camera.ui, text="SHIELD: 0%", position=(-0.85, 0.33), scale=1.35,
-            color=color.rgb32(120, 220, 255), background=True, font=HUD_FONT,
+            parent=camera.ui, text="SHIELD: 0%", position=(-0.85, 0.275), scale=1.35,
+            color=color.rgb32(120, 220, 255), font=HUD_FONT,
         )
+        self.shield_bar_bg = Entity(parent=camera.ui, model="quad", color=color.rgba32(255, 255, 255, 35),
+                                     scale=(SHIELD_BAR_WIDTH, 0.022), position=(-0.71, 0.232), origin=(-0.5, 0))
+        self.shield_bar_fill = Entity(parent=camera.ui, model="quad", color=color.rgb32(120, 220, 255),
+                                       scale=(0.001, 0.022), position=(-0.71, 0.232), origin=(-0.5, 0))
+
         self.warn_text = Text(
-            parent=camera.ui, text="Player A pose not detected -- using last known state",
-            position=(-0.85, -0.46), scale=1.0, color=color.rgb32(255, 200, 80), enabled=False,
-            font=HUD_FONT,
+            parent=camera.ui, text="TRACKING LOST", position=(-0.85, -0.46), scale=0.9,
+            color=color.rgb32(255, 120, 120), background=True, enabled=False, font=HUD_FONT,
         )
+
         self.gameover_text = Text(
-            parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.08),
+            parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.2),
             scale=3.6, color=color.rgb32(255, 80, 80), enabled=False, font=HUD_FONT,
+        )
+        self.new_best_text = Text(
+            parent=camera.ui, text="NEW BEST!", origin=(0, 0), position=(0, 0.1),
+            scale=1.9, color=color.rgb32(255, 210, 60), enabled=False, font=HUD_FONT,
+        )
+        self.final_stats_text = Text(
+            parent=camera.ui, text="", origin=(0, 0), position=(0, 0.0),
+            scale=1.3, color=color.rgb32(220, 220, 228), enabled=False, font=HUD_FONT,
         )
         self.hint_text = Text(
             parent=camera.ui, text="PRESS R TO RESTART, Q TO QUIT", origin=(0, 0),
-            position=(0, -0.08), scale=1.4, color=color.rgb32(235, 235, 240), enabled=False,
+            position=(0, -0.12), scale=1.4, color=color.rgb32(235, 235, 240), enabled=False,
             font=HUD_FONT,
         )
         self.countdown_text = Text(
             parent=camera.ui, text="", origin=(0, 0), position=(0, 0.1),
             scale=4.5, color=color.rgb32(255, 255, 255), background=True, enabled=False,
         )
+
+    def _spawn_pickup_popup(self, text, popup_color):
+        """A floating "+N" that pops up above the coins counter and fades
+        out -- otherwise a coin pickup is silent except for the counter
+        ticking, which is easy to miss mid-sprint."""
+        popup = Text(parent=camera.ui, text=text, position=(-0.55, 0.335), scale=1.5,
+                     origin=(0, 0), color=popup_color, font=HUD_FONT)
+        popup.animate_position((-0.55, 0.5), duration=PICKUP_POPUP_DURATION, curve=curve.out_quad)
+        popup.animate_color(color.rgba(popup_color[0], popup_color[1], popup_color[2], 0),
+                             duration=PICKUP_POPUP_DURATION, curve=curve.linear)
+        destroy(popup, delay=PICKUP_POPUP_DURATION + 0.05)
+
+    def _flash_screen(self, flash_color):
+        """A brief full-screen color wash on shield activation -- the
+        bubble around the player is easy to miss if the camera's mid-shake
+        or the player's off to one side of frame."""
+        flash = Entity(parent=camera.ui, model="quad",
+                        color=color.rgba(flash_color[0], flash_color[1], flash_color[2], 0.35),
+                        scale=(8, 8), z=-1)
+        flash.animate_color(color.rgba(flash_color[0], flash_color[1], flash_color[2], 0),
+                             duration=SHIELD_FLASH_DURATION, curve=curve.out_quad)
+        destroy(flash, delay=SHIELD_FLASH_DURATION + 0.05)
 
     # --- lifecycle -------------------------------------------------------
 
@@ -428,7 +487,8 @@ class Game:
         for coin in getattr(self, "coins", []):
             coin.destroy()
         self.coins = []
-        self.coins_collected = 0
+        self.coins_collected = 0       # spendable balance -- drops by SHIELD_COIN_COST on activation
+        self.total_coins_collected = 0  # lifetime-this-run count, for the game-over stats -- never decreases
         self.shield_active = False
         self.shield_timer = 0.0
         self._next_coin_spawn = random.uniform(COIN_SPAWN_INTERVAL_MIN, COIN_SPAWN_INTERVAL_MAX)
@@ -438,6 +498,8 @@ class Game:
         self.game_state.reset()
         self.gameover_text.enabled = False
         self.hint_text.enabled = False
+        self.new_best_text.enabled = False
+        self.final_stats_text.enabled = False
 
         self.countdown_active = True
         self.countdown_remaining = COUNTDOWN_SECONDS
@@ -514,11 +576,20 @@ class Game:
 
         self.countdown_remaining -= dt
         if self.countdown_remaining > 0:
-            self.countdown_text.text = str(math.ceil(self.countdown_remaining))
+            new_text = str(math.ceil(self.countdown_remaining))
+            if new_text != self.countdown_text.text:
+                self.countdown_text.text = new_text
+                self._pulse_countdown()
         else:
             self.countdown_active = False
             self.countdown_text.text = "GO!"
+            self._pulse_countdown()
             invoke(setattr, self.countdown_text, "enabled", False, delay=COUNTDOWN_GO_HOLD_SEC)
+
+    def _pulse_countdown(self):
+        base_scale = 4.5
+        self.countdown_text.scale = base_scale * COUNTDOWN_PULSE_SCALE
+        self.countdown_text.animate_scale(base_scale, duration=COUNTDOWN_PULSE_DURATION, curve=curve.out_quad)
 
     def update(self, dt):
         self.survived_sec += dt
@@ -644,7 +715,9 @@ class Game:
                     # explicit shield-activation message, not automatically
                     # the moment the count crosses the threshold.
                     self.coins_collected += 1
+                    self.total_coins_collected += 1
                     self.score += COIN_SCORE_VALUE
+                    self._spawn_pickup_popup(f"+{COIN_SCORE_VALUE}", color.rgb32(255, 210, 60))
                     coin.destroy()
                     continue
 
@@ -691,6 +764,7 @@ class Game:
         self.coins_collected -= SHIELD_COIN_COST
         self.shield_active = True
         self.shield_timer = SHIELD_DURATION_SEC
+        self._flash_screen(color.rgb32(120, 220, 255))
 
     def _update_shield_timer(self, dt):
         if not self.shield_active:
@@ -736,15 +810,25 @@ class Game:
 
     def draw(self):
         self.score_text.text = f"SCORE: {int(self.score)}"
+        self.best_text.text = f"BEST: {int(max(self.best_score, self.score))}"
         self.coins_text.text = f"COINS: {self.coins_collected}"
         if self.shield_active:
             self.shield_text.text = f"SHIELD: ACTIVE ({self.shield_timer:.1f}s)"
+            self.shield_bar_fill.scale_x = SHIELD_BAR_WIDTH
         else:
-            pct = int(100 * self.coins_collected / SHIELD_COIN_COST)
-            self.shield_text.text = f"SHIELD: {pct}%"
+            pct = min(1.0, self.coins_collected / SHIELD_COIN_COST)
+            self.shield_text.text = f"SHIELD: {int(pct * 100)}%"
+            self.shield_bar_fill.scale_x = max(0.001, SHIELD_BAR_WIDTH * pct)
         self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
 
     def _show_game_over(self):
         self.gameover_text.enabled = True
         self.hint_text.enabled = True
+
+        is_new_best = self.score > self.best_score
+        if is_new_best:
+            self.best_score = self.score
+        self.new_best_text.enabled = is_new_best
+        self.final_stats_text.enabled = True
+        self.final_stats_text.text = f"COINS COLLECTED: {self.total_coins_collected}   SCORE: {int(self.score)}"
