@@ -19,6 +19,7 @@ tracking dies mid-demo, not just for hour-0 testing):
     h / m / l   -- force current obstacle type to high / medium / low
     SPACE       -- manually fire a placement with whatever lane/obstacle
                    is currently selected (bypasses the punch gesture)
+    f           -- toggle fullscreen
     q           -- quit
 """
 import argparse
@@ -28,6 +29,8 @@ import cv2
 
 from player_b_tracker import PlayerBTracker, LANE_NAMES, OBSTACLE_HIGH, OBSTACLE_MEDIUM, OBSTACLE_LOW
 from websocket_client import WebSocketClient, DEFAULT_PORT
+
+WINDOW_NAME = "Player B (obstacle placer)"
 
 
 def parse_args():
@@ -52,7 +55,11 @@ def main():
     client.start()
 
     print(f"[main] connecting out to {args.server_ip}:{args.port} ...")
-    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = obstacle type, SPACE = force-place, q = quit")
+    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = obstacle type, SPACE = force-place, f = fullscreen, q = quit")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    fullscreen = True
 
     # Manual override state for the keyboard fallback path. None means
     # "use whatever the camera tracker is currently reading".
@@ -90,11 +97,17 @@ def main():
                 cv2.putText(frame, "MANUAL OVERRIDE ACTIVE", (10, frame.shape[0] - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-            cv2.imshow("Player B (obstacle placer)", frame)
+            cv2.imshow(WINDOW_NAME, frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+            elif key == ord('f'):
+                fullscreen = not fullscreen
+                cv2.setWindowProperty(
+                    WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
+                )
             elif key == ord('1'):
                 manual_lane = 0
             elif key == ord('2'):

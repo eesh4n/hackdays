@@ -7,16 +7,22 @@ validated in hackathon-prep/test_lean_detection.py, just used for
 zone-select instead of raw lean angle since a lane needs a discrete pick,
 not a continuous value.
 
-Within whichever lane the player is standing in, hand height selects the
-obstacle type:
-  - hands above head level          -> HIGH obstacle
-  - hands at shoulder/torso level (between head and waist) -> MEDIUM obstacle
-  - hands below waist level         -> LOW obstacle
+The two hands have separate jobs, so the program never has to guess whether
+a hand is selecting a height or starting a punch:
+
+  LEFT hand  -- selects the obstacle type by its height:
+      above head level                          -> HIGH obstacle
+      shoulder/torso level (head to waist)      -> MEDIUM obstacle
+      below waist level                         -> LOW obstacle
+  RIGHT hand -- throws the punch that actually places the obstacle.
 
 Lane and obstacle type are both just continuously-tracked *state* -- they
-don't fire anything by themselves. Placement fires only on a PUNCH gesture
-(a fast forward/outward extension of a wrist away from the shoulder), so
-standing there with your hands up doesn't spam obstacles every frame.
+don't fire anything by themselves. Placement fires only on a PUNCH gesture,
+detected from the punching wrist's own recent path (not its distance from
+the shoulder -- that metric mostly picked up shoulder flexion/raising the
+arm, not an actual punch): a short window of positions is checked for
+enough net displacement, covered fast enough, and in a straight-enough
+line to look like a real thrown punch rather than jitter or a reposition.
 
 Uses the MediaPipe Tasks PoseLandmarker API (mp.solutions.pose is gone as
 of mediapipe 0.10.35 -- see hackathon-prep/PLAN.md finding #1). Needs
@@ -40,6 +46,15 @@ LEFT_WRIST, RIGHT_WRIST = 15, 16
 LEFT_HIP, RIGHT_HIP = 23, 24
 LEFT_KNEE, RIGHT_KNEE = 25, 26
 
+# Hand roles. main.py mirrors the frame (cv2.flip) so the preview reads like
+# a mirror to the player -- and MediaPipe labels landmarks from what it sees,
+# so on a mirrored frame its LEFT_* landmarks are the player's physical RIGHT
+# side. These two constants are named for the PLAYER's physical hands; if the
+# roles come out reversed (e.g. on a setup that doesn't mirror the frame),
+# swap the two values.
+PUNCH_WRIST = LEFT_WRIST     # player's physical RIGHT hand -- throws the punch
+HEIGHT_WRIST = RIGHT_WRIST   # player's physical LEFT hand -- picks obstacle height
+
 LANE_NAMES = ("left", "center", "right")
 OBSTACLE_HIGH = "high"
 OBSTACLE_MEDIUM = "medium"
@@ -57,16 +72,36 @@ LANE_HYSTERESIS = 0.035  # widen/narrow the dead zone around each boundary
 # level from flip-flopping between two obstacle types every frame.
 HEIGHT_MARGIN = 0.02  # normalized y-units
 
-# Punch-gesture detection: a wrist's distance from its shoulder (normalized
-# 0-1 coords) has to grow faster than PUNCH_VELOCITY_THRESHOLD (units/sec)
-# while already past PUNCH_MIN_EXTENSION, to count as a punch-out. The
-# tracker re-arms only once the wrist retracts back below the same
-# extension threshold, so one punch can't double-fire while the arm is
-# still out.
-PUNCH_MIN_EXTENSION = 0.18       # normalized distance, roughly "arm mostly extended"
-PUNCH_VELOCITY_THRESHOLD = 1.4   # normalized-distance units per second
-PUNCH_COOLDOWN_SEC = 0.5         # minimum time between two accepted placements
-VELOCITY_SMOOTHING_WINDOW = 3    # frames averaged for velocity, to fight jitter
+# Punch-gesture detection: tracks the right wrist's own recent path (a
+# rolling window of its last PUNCH_PATH_WINDOW_SEC seconds of positions),
+# not its distance from the shoulder -- distance-from-shoulder mostly
+# reacted to shoulder flexion/extension (raising the arm), not the wrist
+# actually being thrown forward.
+#
+# A punch is recognized from three things measured over that window:
+#   - net displacement (start-to-end distance) is large enough
+#   - it happened fast enough (highest single-frame speed within the window)
+#   - the path is reasonably straight (net displacement / total path length
+#     close to 1.0), so a fast but wandering/circular hand motion doesn't
+#     count -- a thrown punch is a fairly direct line.
+#
+# Debounced by a plain time cooldown (not by requiring any specific
+# resting position), so it can't get stuck waiting for a pose that never
+# happens. If punches still aren't registering, check the live
+# "disp/speed/straight" numbers in the debug overlay against these
+# constants to see which condition is failing.
+# Thresholds below are calibrated from a recorded session of real punches
+# (see calibrate_punch.py). Measured punches landed at disp 0.116-0.198,
+# speed 0.65-3.41, straightness 0.81-1.00, while idle hand jitter stayed
+# under disp 0.076 -- so displacement is the cleanest separator and these
+# sit in the gap between the two clusters. The straightness floor also
+# rejects MediaPipe landmark glitches, which show huge speed (10+) but
+# near-zero straightness since the wrist "jumps" rather than travels.
+PUNCH_PATH_WINDOW_SEC = 0.35       # how far back to look for a punch trajectory
+PUNCH_MIN_NET_DISPLACEMENT = 0.10  # normalized distance, start-to-end of the window
+PUNCH_MIN_PEAK_SPEED = 0.60        # normalized units/sec, fastest single-frame segment in the window
+PUNCH_MIN_STRAIGHTNESS = 0.70      # net displacement / total path length (1.0 = perfectly straight)
+PUNCH_COOLDOWN_SEC = 0.5           # minimum time between two accepted placements
 
 
 class PlayerBTracker:
@@ -92,13 +127,16 @@ class PlayerBTracker:
         self.obstacle_type = OBSTACLE_MEDIUM
         self.pose_visible = False
 
-        # Punch state machine: "armed" (ready to detect a punch) or
-        # "extended" (arm is out, waiting for retraction before re-arming).
-        self._punch_state = "armed"
-        self._last_extension = 0.0
-        self._extension_history = deque(maxlen=VELOCITY_SMOOTHING_WINDOW)
-        self._last_frame_time = None
+        # Rolling window of the right wrist's recent (t, x, y) positions,
+        # used to detect a punch from its actual path. Debounced by a
+        # plain time cooldown, see constants above.
+        self._wrist_path = deque()
+        self._last_net_displacement = 0.0
+        self._last_peak_speed = 0.0
+        self._last_straightness = 0.0
         self._last_punch_time = 0.0
+        self._punch_wrist_xy = None
+        self._height_wrist_xy = None
 
     def close(self):
         self._landmarker.close()
@@ -129,12 +167,15 @@ class PlayerBTracker:
             self.lane = self._update_lane(lm)
             self.obstacle_type = self._compute_obstacle_type(lm)
             event = self._update_punch_state(lm, now)
+            # Kept for the debug overlay so you can see which physical hand
+            # the code has bound to which role.
+            self._punch_wrist_xy = (lm[PUNCH_WRIST].x, lm[PUNCH_WRIST].y)
+            self._height_wrist_xy = (lm[HEIGHT_WRIST].x, lm[HEIGHT_WRIST].y)
         else:
             self.pose_visible = False
-            # Lost tracking mid-extension -- don't leave the state machine
-            # stuck waiting for a retraction we'll never see.
-            self._punch_state = "armed"
-            self._extension_history.clear()
+            # Lost tracking -- clear the path so the next detected frame
+            # doesn't treat the gap as part of one continuous motion.
+            self._wrist_path.clear()
 
         self._last_frame_time = now
 
@@ -167,7 +208,7 @@ class PlayerBTracker:
     def _compute_obstacle_type(self, lm):
         head_y = lm[NOSE].y
         waist_y = (lm[LEFT_HIP].y + lm[RIGHT_HIP].y) / 2
-        wrist_y = min(lm[LEFT_WRIST].y, lm[RIGHT_WRIST].y)  # higher wrist wins (smaller y = higher up)
+        wrist_y = lm[HEIGHT_WRIST].y  # left hand only -- punching hand is ignored here
 
         if wrist_y <= head_y + HEIGHT_MARGIN:
             return OBSTACLE_HIGH
@@ -177,36 +218,45 @@ class PlayerBTracker:
             return OBSTACLE_MEDIUM
 
     def _update_punch_state(self, lm, now):
-        # Track whichever arm is currently more extended from its shoulder.
-        left_ext = _dist(lm[LEFT_WRIST], lm[LEFT_SHOULDER])
-        right_ext = _dist(lm[RIGHT_WRIST], lm[RIGHT_SHOULDER])
-        extension = max(left_ext, right_ext)
+        # Right hand only -- the left hand's height selection can't trigger this.
+        wrist = lm[PUNCH_WRIST]
+        self._wrist_path.append((now, wrist.x, wrist.y))
+        while self._wrist_path and now - self._wrist_path[0][0] > PUNCH_PATH_WINDOW_SEC:
+            self._wrist_path.popleft()
 
-        self._extension_history.append((now, extension))
-
-        velocity = 0.0
-        if len(self._extension_history) >= 2:
-            (t0, e0) = self._extension_history[0]
-            (t1, e1) = self._extension_history[-1]
+        pts = list(self._wrist_path)
+        path_length = 0.0
+        peak_speed = 0.0
+        for (t0, x0, y0), (t1, x1, y1) in zip(pts, pts[1:]):
+            seg = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+            path_length += seg
             dt = t1 - t0
             if dt > 0:
-                velocity = (e1 - e0) / dt
+                peak_speed = max(peak_speed, seg / dt)
 
-        self._last_extension = extension
+        if len(pts) >= 2:
+            (t0, x0, y0) = pts[0]
+            (t1, x1, y1) = pts[-1]
+            net_displacement = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+        else:
+            net_displacement = 0.0
 
-        if self._punch_state == "armed":
-            past_cooldown = (now - self._last_punch_time) >= PUNCH_COOLDOWN_SEC
-            if (
-                past_cooldown
-                and extension >= PUNCH_MIN_EXTENSION
-                and velocity >= PUNCH_VELOCITY_THRESHOLD
-            ):
-                self._punch_state = "extended"
-                self._last_punch_time = now
-                return {"lane": self.lane, "obstacle_type": self.obstacle_type}
-        else:  # "extended" -- wait for retraction before re-arming
-            if extension < PUNCH_MIN_EXTENSION * 0.7:
-                self._punch_state = "armed"
+        straightness = (net_displacement / path_length) if path_length > 0 else 0.0
+
+        self._last_net_displacement = net_displacement
+        self._last_peak_speed = peak_speed
+        self._last_straightness = straightness
+
+        past_cooldown = (now - self._last_punch_time) >= PUNCH_COOLDOWN_SEC
+        if (
+            past_cooldown
+            and net_displacement >= PUNCH_MIN_NET_DISPLACEMENT
+            and peak_speed >= PUNCH_MIN_PEAK_SPEED
+            and straightness >= PUNCH_MIN_STRAIGHTNESS
+        ):
+            self._last_punch_time = now
+            self._wrist_path.clear()  # don't let the same motion double-fire
+            return {"lane": self.lane, "obstacle_type": self.obstacle_type}
 
         return None
 
@@ -224,14 +274,38 @@ class PlayerBTracker:
         lane_color = (0, 255, 0) if self.pose_visible else (0, 0, 255)
         cv2.putText(frame, f"lane: {LANE_NAMES[self.lane]}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, lane_color, 2)
-        cv2.putText(frame, f"obstacle: {self.obstacle_type}", (10, 60),
+        cv2.putText(frame, f"obstacle: {self.obstacle_type} (L hand)", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, lane_color, 2)
 
-        state_color = (0, 255, 255) if self._punch_state == "extended" else (200, 200, 200)
-        cv2.putText(frame, f"punch state: {self._punch_state}", (10, 90),
+        cooldown_remaining = max(0.0, PUNCH_COOLDOWN_SEC - (time.time() - self._last_punch_time))
+        ready = cooldown_remaining <= 0
+        state_color = (0, 255, 0) if ready else (0, 165, 255)
+        state_text = "ready" if ready else f"cooldown {cooldown_remaining:.1f}s"
+        cv2.putText(frame, f"punch (R hand): {state_text}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
+        cv2.putText(
+            frame,
+            f"disp: {self._last_net_displacement:.3f} (need {PUNCH_MIN_NET_DISPLACEMENT})  "
+            f"speed: {self._last_peak_speed:.2f} (need {PUNCH_MIN_PEAK_SPEED})",
+            (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1,
+        )
+        cv2.putText(
+            frame,
+            f"straight: {self._last_straightness:.2f} (need {PUNCH_MIN_STRAIGHTNESS})",
+            (10, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 1,
+        )
+
+        # Mark both tracked wrists so it's obvious at a glance which physical
+        # hand is bound to which role -- swap PUNCH_WRIST/HEIGHT_WRIST if
+        # these labels land on the wrong hands.
+        if self._height_wrist_xy is not None:
+            hx, hy = self._height_wrist_xy
+            cv2.circle(frame, (int(hx * w), int(hy * h)), 10, (255, 180, 0), -1)
+            cv2.putText(frame, "HEIGHT", (int(hx * w) + 14, int(hy * h) + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 180, 0), 2)
+        if self._punch_wrist_xy is not None:
+            px, py = self._punch_wrist_xy
+            cv2.circle(frame, (int(px * w), int(py * h)), 10, (0, 100, 255), -1)
+            cv2.putText(frame, "PUNCH", (int(px * w) + 14, int(py * h) + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 2)
         return frame
-
-
-def _dist(a, b):
-    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
