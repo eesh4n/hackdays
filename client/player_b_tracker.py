@@ -92,11 +92,12 @@ FINGER_MCP_PIP_TIP_TRIOS = (
     (RING_MCP, RING_PIP, RING_TIP),
     (PINKY_MCP, PINKY_PIP, PINKY_TIP),
 )
-FIST_MIN_CURLED_FINGERS = 3  # of 4, majority vote
+FIST_MIN_CURLED_FINGERS = 2  # of 4 -- lowered from 3 so a loose/partial fist still registers
 # A fully straight finger reads ~180 degrees at the PIP joint; this is how
 # far below straight it has to bend to count as "curled". Tune down (e.g.
 # 140) to require a tighter fist, up (e.g. 165) to accept a looser one.
-FIST_CURL_ANGLE_MAX_DEG = 150.0
+# Raised from 150 -- a half-curled hand was too often reading as "open".
+FIST_CURL_ANGLE_MAX_DEG = 165.0
 
 POSE_SAMPLE_EVERY_N_FRAMES = 8  # lane only needs occasional updates, not every frame
 
@@ -179,7 +180,9 @@ LANE_HYSTERESIS = 0.035  # widen/narrow the dead zone around each boundary
 
 # GRAB zone: the entire top strip of the frame, full width, one zone --
 # grabbing here doesn't decide a type, it just picks up a generic object.
-GRAB_ZONE_HEIGHT_FRAC = 0.20
+# Widened from 0.20 -- a bigger target is easier to reach into and grab
+# from without needing your hand right up near the top edge of frame.
+GRAB_ZONE_HEIGHT_FRAC = 0.32
 
 # DROP zones: the rest of the frame (below the grab strip), split into
 # three equal-width zones left-to-right = LOW/MEDIUM/HIGH. Deliberately
