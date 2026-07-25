@@ -127,8 +127,12 @@ CLOSE_DEBOUNCE_FRAMES = 2
 # Detections below this confidence are discarded before they ever reach the
 # lock/fist logic -- a low-confidence detection is often a half-occluded
 # or motion-blurred hand, exactly the kind of noisy read that would
-# otherwise feed garbage into everything downstream.
-HAND_MIN_CONFIDENCE = 0.6
+# otherwise feed garbage into everything downstream. 0.6 was picked
+# without measuring real handedness scores from this pipeline and turned
+# out to reject far too many genuinely-fine detections in practice --
+# lowered until proven otherwise by the on-screen confidence readout
+# (see debug_overlay) rather than guessed again blind.
+HAND_MIN_CONFIDENCE = 0.2
 
 # Exponential smoothing on the tracked palm position (0 < alpha <= 1;
 # higher = less smoothing, more responsive). Raw per-frame landmark
@@ -217,6 +221,7 @@ class PlayerBTracker:
         self.lane = 1              # default to center lane until first detection
         self.pose_visible = False
         self.hand_visible = False
+        self.hand_confidence = None  # best handedness score seen this frame, even if it didn't qualify
         self.fist_closed = False
         self.hand_xy = None        # (x, y) normalized, palm-center position of the tracked hand
         self.is_carrying = False   # holding a (still generic, type undecided) grabbed object
@@ -289,7 +294,14 @@ class PlayerBTracker:
                 self.pose_visible = False
 
         hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-        candidates = _filter_confident(hand_result.hand_landmarks, hand_result.handedness)
+        scored = _pair_with_confidence(hand_result.hand_landmarks, hand_result.handedness)
+        # Tracked regardless of whether anything qualifies below, so the
+        # debug overlay can show "a hand WAS seen, just below threshold"
+        # instead of an undifferentiated "no hand" -- this is exactly the
+        # number that should drive HAND_MIN_CONFIDENCE, not a guess.
+        self.hand_confidence = max((s for _, s in scored), default=None)
+        candidates = [lm for lm, s in scored if s >= HAND_MIN_CONFIDENCE]
+
         selected = None
         if candidates:
             # None means the model found a confident hand (or two), but
@@ -524,8 +536,9 @@ class PlayerBTracker:
 
         hand_color = (0, 0, 255) if not self.hand_visible else ((0, 165, 255) if self.fist_closed else (0, 255, 0))
         hand_state = "no hand" if not self.hand_visible else ("FIST" if self.fist_closed else "open")
-        cv2.putText(frame, f"hand: {hand_state}", (10, h - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, hand_color, 2)
+        conf_text = f"{self.hand_confidence:.2f}" if self.hand_confidence is not None else "--"
+        cv2.putText(frame, f"hand: {hand_state}  (confidence: {conf_text}, need >= {HAND_MIN_CONFIDENCE})",
+                    (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, hand_color, 2)
 
         if self.hand_xy is not None:
             hx, hy = self.hand_xy
@@ -548,18 +561,18 @@ def _dist(a, b):
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
 
 
-def _filter_confident(hand_landmarks_list, handedness_list):
+def _pair_with_confidence(hand_landmarks_list, handedness_list):
     """Pairs each detected hand's landmarks with its handedness confidence
-    score and drops anything below HAND_MIN_CONFIDENCE -- a low-confidence
-    detection is often a half-occluded or motion-blurred hand, exactly the
-    kind of noisy read that would otherwise feed garbage into the lock and
-    fist-detection logic downstream, before those even get a chance to
-    reject it."""
-    confident = []
+    score (0.0 if the score is missing for some reason). Does NOT filter --
+    the caller decides what to do with low scores, and keeping every score
+    around (not just the ones that pass) is what makes the on-screen
+    confidence readout actually useful for tuning HAND_MIN_CONFIDENCE from
+    real numbers instead of guessing at it again."""
+    pairs = []
     for lm, handedness in zip(hand_landmarks_list, handedness_list):
-        if handedness and handedness[0].score >= HAND_MIN_CONFIDENCE:
-            confident.append(lm)
-    return confident
+        score = handedness[0].score if handedness else 0.0
+        pairs.append((lm, score))
+    return pairs
 
 
 # Average of the wrist and the four finger base-knuckles -- a much more
