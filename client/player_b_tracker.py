@@ -31,16 +31,23 @@ pose-sampled measured ~27fps with an 88% hand-detection rate -- close to
 running just one model.
 
 Fist detection is a landmark-geometry heuristic (no separate classifier
-needed): for each of the four non-thumb fingers, the fingertip is closer
-to the wrist than that finger's PIP joint when curled into a fist, and
-farther away when extended. Majority vote (3 of 4) tolerates one
-misdetected finger.
+needed): for each of the four non-thumb fingers, curl is the bend ANGLE
+at that finger's own PIP joint (using x/y/z, so the hand's rough depth
+counts too) -- not distance from the wrist. Distance-from-wrist is
+rotation-sensitive: it depends on the hand's overall position/orientation
+in frame, so turning the hand sideways to the camera changes those
+numbers even if the fingers haven't moved relative to each other at all.
+Joint angle only depends on a finger's own two segments relative to one
+another, so "is this finger bent" reads the same regardless of how the
+whole hand is rotated in view. Majority vote (3 of 4 fingers) tolerates
+one misdetected finger.
 
 Uses the MediaPipe Tasks API for both PoseLandmarker and HandLandmarker
 (mp.solutions.* is gone as of mediapipe 0.10.35 -- see
 hackathon-prep/PLAN.md finding #1). Needs pose_landmarker_lite.task and
 hand_landmarker.task in the project's models/ folder (see MODEL_PATHS).
 """
+import math
 import time
 from pathlib import Path
 
@@ -52,9 +59,13 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 POSE_MODEL_PATH = MODELS_DIR / "pose_landmarker_lite.task"
 HAND_MODEL_PATH = MODELS_DIR / "hand_landmarker.task"
 
-# Pose landmark indices (MediaPipe Pose topology) -- only hips are used,
-# to compute lane from hip-center x position.
+# Pose landmark indices (MediaPipe Pose topology). Hips give lane from
+# hip-center x position; shoulders give a stable body-scale reference (see
+# MAX_LOCK_JUMP_FRAC below) so distance thresholds scale with how close
+# the player is standing to the camera instead of being a fixed number of
+# raw image-coordinate units.
 LEFT_HIP, RIGHT_HIP = 23, 24
+LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 
 # Hand landmark indices (MediaPipe Hand topology, 21 points per hand).
 WRIST = 0
@@ -62,25 +73,36 @@ INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
 RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
 PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
-# (TIP, PIP) pairs for the four fingers used in the fist heuristic -- thumb
-# excluded, it doesn't fold toward the wrist the same way on a fist.
-FINGER_TIP_PIP_PAIRS = (
-    (INDEX_TIP, INDEX_PIP),
-    (MIDDLE_TIP, MIDDLE_PIP),
-    (RING_TIP, RING_PIP),
-    (PINKY_TIP, PINKY_PIP),
+# (MCP, PIP, TIP) trios for the four fingers used in the fist heuristic --
+# thumb excluded, it doesn't fold the same way on a fist. The bend angle
+# is measured AT the PIP joint (the middle element of each trio).
+FINGER_MCP_PIP_TIP_TRIOS = (
+    (INDEX_MCP, INDEX_PIP, INDEX_TIP),
+    (MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP),
+    (RING_MCP, RING_PIP, RING_TIP),
+    (PINKY_MCP, PINKY_PIP, PINKY_TIP),
 )
 FIST_MIN_CURLED_FINGERS = 3  # of 4, majority vote
+# A fully straight finger reads ~180 degrees at the PIP joint; this is how
+# far below straight it has to bend to count as "curled". Tune down (e.g.
+# 140) to require a tighter fist, up (e.g. 165) to accept a looser one.
+FIST_CURL_ANGLE_MAX_DEG = 150.0
 
 POSE_SAMPLE_EVERY_N_FRAMES = 5  # lane only needs occasional updates, not every frame
 
 # Hand-lock tuning. A locked candidate is only accepted if its palm sits
-# within this normalized distance of the last known position -- without a
-# ceiling, "pick whichever candidate is closest" will still confidently
-# adopt a completely different hand (or person) if that's all that's on
-# screen, since "closest" has no concept of "too far to plausibly be the
-# same hand between two frames".
-MAX_LOCK_JUMP_DIST = 0.15
+# within MAX_LOCK_JUMP_FRAC shoulder-widths of the last known position --
+# without a ceiling, "pick whichever candidate is closest" will still
+# confidently adopt a completely different hand (or person) if that's all
+# that's on screen, since "closest" has no concept of "too far to
+# plausibly be the same hand between two frames". Scaled by shoulder width
+# (a stable per-person reference from pose, not the moving hand itself) so
+# the same real-world hand speed reads the same regardless of how far the
+# player is standing from the camera -- a fixed raw-coordinate threshold
+# would be too tight up close and too loose far away, the same distance-
+# invariance problem that bit the old punch thresholds.
+MAX_LOCK_JUMP_FRAC = 1.0
+DEFAULT_SHOULDER_WIDTH = 0.15  # fallback before pose has sampled even once
 
 # If the tracked hand goes fully undetected for this long, drop whatever
 # was being carried rather than risk a "phantom drop" firing wherever the
@@ -93,10 +115,28 @@ HAND_LOST_CANCEL_CARRY_SEC = 0.6
 HAND_LOST_FORGET_LOCK_SEC = 1.0
 
 # The fist-closed reading is a coarse per-frame heuristic and can flicker
-# for a single frame even mid-gesture. Requiring it to read "open" for
-# this many consecutive frames before treating it as a real release stops
-# one noisy frame from silently cancelling an entire carry.
+# for a single frame even mid-gesture. Requiring it to read "open"/"closed"
+# for this many consecutive frames before treating either as real stops
+# one noisy frame from silently cancelling an entire carry (OPEN) or
+# triggering an accidental grab just from passing a hand through the
+# strip (CLOSE) -- same root cause (a single-frame misread), so both
+# directions get the same debounce, not just the one that was reported.
 OPEN_DEBOUNCE_FRAMES = 2
+CLOSE_DEBOUNCE_FRAMES = 2
+
+# Detections below this confidence are discarded before they ever reach the
+# lock/fist logic -- a low-confidence detection is often a half-occluded
+# or motion-blurred hand, exactly the kind of noisy read that would
+# otherwise feed garbage into everything downstream.
+HAND_MIN_CONFIDENCE = 0.6
+
+# Exponential smoothing on the tracked palm position (0 < alpha <= 1;
+# higher = less smoothing, more responsive). Raw per-frame landmark
+# position has real pixel-level jitter even when the hand isn't actually
+# moving, which was making zone-boundary checks (grab/drop) flicker right
+# at the edges. This is applied to the position used for BOTH the
+# on-screen marker and the zone/lock math, not just cosmetically.
+PALM_SMOOTHING_ALPHA = 0.5
 
 LANE_NAMES = ("left", "center", "right")
 OBSTACLE_HIGH = "high"
@@ -164,9 +204,12 @@ class PlayerBTracker:
                 num_hands=2,
             )
         )
-        self._locked_palm_xy = None  # last known position of the hand we're tracking
+        self._locked_palm_xy = None  # last known SMOOTHED position of the hand we're tracking
         self._hand_lost_since = None  # timestamp the hand FIRST went undetected, or None if currently seen
         self._fist_open_streak = 0    # consecutive frames read "open" while carrying, for debounce
+        self._fist_closed_streak = 0  # consecutive frames read "closed" while not carrying, for debounce
+        self._shoulder_width = DEFAULT_SHOULDER_WIDTH  # updated whenever pose is sampled
+        self._smoothed_palm_xy = None  # EMA state, reset to None whenever the hand is lost
         self._start_time = time.time()
         self._frame_count = 0
 
@@ -203,6 +246,18 @@ class PlayerBTracker:
         decayed = PLACEMENT_COOLDOWN_MAX_SEC - PLACEMENT_COOLDOWN_DECAY_PER_PLACEMENT * self.placement_count
         return max(PLACEMENT_COOLDOWN_MIN_SEC, decayed)
 
+    def try_manual_placement(self, lane, obstacle_type):
+        """For the keyboard fallback (SPACE key) -- applies the exact same
+        cooldown pacing as a real gesture placement, rather than letting
+        the fallback path spam instantly with no pacing at all. Returns
+        the event dict if it fired, or None if still on cooldown."""
+        now = time.time()
+        if (now - self._last_placement_time) < self.current_cooldown_sec:
+            return None
+        self._last_placement_time = now
+        self.placement_count += 1
+        return {"lane": lane, "obstacle_type": obstacle_type}
+
     def process_frame(self, rgb_frame):
         """rgb_frame: HxWx3 RGB numpy array (already flipped/converted by caller).
 
@@ -225,28 +280,45 @@ class PlayerBTracker:
             pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
             if pose_result.pose_landmarks:
                 self.pose_visible = True
-                self.lane = self._update_lane(pose_result.pose_landmarks[0])
+                pose_lm = pose_result.pose_landmarks[0]
+                self.lane = self._update_lane(pose_lm)
+                width = _dist(pose_lm[LEFT_SHOULDER], pose_lm[RIGHT_SHOULDER])
+                if width > 0:
+                    self._shoulder_width = width
             else:
                 self.pose_visible = False
 
         hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+        candidates = _filter_confident(hand_result.hand_landmarks, hand_result.handedness)
         selected = None
-        if hand_result.hand_landmarks:
-            # None means the model found a hand (or two), but neither is
-            # close enough to our last known position to plausibly be the
-            # SAME hand -- treated the same as no detection at all, rather
-            # than blindly adopting whatever showed up.
-            selected = self._select_locked_hand(hand_result.hand_landmarks)
+        if candidates:
+            # None means the model found a confident hand (or two), but
+            # neither is close enough to our last known position to
+            # plausibly be the SAME hand -- treated the same as no
+            # detection at all, rather than blindly adopting whatever
+            # showed up.
+            selected = self._select_locked_hand(candidates)
 
         event = None
         if selected is not None:
             self.hand_visible = True
             self._hand_lost_since = None
-            self.hand_xy = _palm_center(selected)
+            raw_xy = _palm_center(selected)
+            if self._smoothed_palm_xy is None:
+                self._smoothed_palm_xy = raw_xy
+            else:
+                sx, sy = self._smoothed_palm_xy
+                rx, ry = raw_xy
+                self._smoothed_palm_xy = (
+                    PALM_SMOOTHING_ALPHA * rx + (1 - PALM_SMOOTHING_ALPHA) * sx,
+                    PALM_SMOOTHING_ALPHA * ry + (1 - PALM_SMOOTHING_ALPHA) * sy,
+                )
+            self.hand_xy = self._smoothed_palm_xy
             self._locked_palm_xy = self.hand_xy
             self.fist_closed = _is_fist(selected)
             event = self._update_grab_place_state(now)
         else:
+            self._smoothed_palm_xy = None  # don't let stale smoothing bleed into the next acquisition
             self._handle_hand_not_visible(now)
 
         return {
@@ -270,24 +342,28 @@ class PlayerBTracker:
         closest -- distance alone doesn't distinguish "this is the same
         hand, slightly moved" from "this is a completely different hand
         that happens to be nearest of the options available". A candidate
-        is only accepted if it's within MAX_LOCK_JUMP_DIST of the last
-        known position; a single detected hand still has to clear this bar,
-        not just multiple candidates (a normal single-player frame usually
-        has exactly one hand detected, so gating only the multi-candidate
-        case would leave the common failure mode -- the tracked hand
-        leaving frame and a different hand becoming the sole detection --
-        completely unguarded)."""
+        is only accepted if it's within MAX_LOCK_JUMP_FRAC shoulder-widths
+        of the last known position -- scaled by the player's own shoulder
+        width (from pose) rather than a fixed raw-coordinate distance, so
+        the same real hand speed reads the same whether the player is
+        standing close to or far from the camera. A single detected hand
+        still has to clear this bar, not just multiple candidates (a
+        normal single-player frame usually has exactly one hand detected,
+        so gating only the multi-candidate case would leave the common
+        failure mode -- the tracked hand leaving frame and a different
+        hand becoming the sole detection -- completely unguarded)."""
         if self._locked_palm_xy is None:
             return all_hand_landmarks[0]
 
         lx, ly = self._locked_palm_xy
+        max_dist = MAX_LOCK_JUMP_FRAC * self._shoulder_width
 
         def _dist_sq(lm):
             px, py = _palm_center(lm)
             return (px - lx) ** 2 + (py - ly) ** 2
 
         best = min(all_hand_landmarks, key=_dist_sq)
-        if _dist_sq(best) > MAX_LOCK_JUMP_DIST ** 2:
+        if _dist_sq(best) > max_dist ** 2:
             return None
         return best
 
@@ -356,21 +432,28 @@ class PlayerBTracker:
         precise-timing requirement was most of what made grabbing feel
         clunky.
 
-        Dropping is level-triggered too, but debounced: fist-open has to
-        hold for OPEN_DEBOUNCE_FRAMES consecutive frames before it counts
-        as a real release. Without this, a single misdetected frame mid-
-        carry (fist briefly reads "open" while still up in the grab strip,
-        nowhere near a drop zone) would silently cancel the whole carry --
-        the fist-closed heuristic is a coarse per-frame geometric read and
-        will flicker occasionally even mid-gesture."""
+        Both grab and drop are debounced, not just drop: the fist-closed
+        heuristic is a coarse per-frame geometric read and can flicker for
+        a single frame in either direction, so both a false "open"
+        mid-carry (would silently cancel the whole carry) and a false
+        "closed" while merely passing a hand through the strip (would
+        grab when nothing was intended) get the same treatment."""
         x, y = self.hand_xy
         event = None
 
         if not self.is_carrying:
             self._fist_open_streak = 0  # not relevant yet -- don't let a stale streak leak into the next carry
-            if self.fist_closed and self._in_grab_zone(y):
+
+            if self.fist_closed:
+                self._fist_closed_streak += 1
+            else:
+                self._fist_closed_streak = 0
+
+            if self._fist_closed_streak >= CLOSE_DEBOUNCE_FRAMES and self._in_grab_zone(y):
                 self.is_carrying = True
+                self._fist_closed_streak = 0
         else:
+            self._fist_closed_streak = 0  # symmetric reset, mirrors the open-streak reset above
             if self.fist_closed:
                 self._fist_open_streak = 0
             else:
@@ -465,6 +548,20 @@ def _dist(a, b):
     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
 
 
+def _filter_confident(hand_landmarks_list, handedness_list):
+    """Pairs each detected hand's landmarks with its handedness confidence
+    score and drops anything below HAND_MIN_CONFIDENCE -- a low-confidence
+    detection is often a half-occluded or motion-blurred hand, exactly the
+    kind of noisy read that would otherwise feed garbage into the lock and
+    fist-detection logic downstream, before those even get a chance to
+    reject it."""
+    confident = []
+    for lm, handedness in zip(hand_landmarks_list, handedness_list):
+        if handedness and handedness[0].score >= HAND_MIN_CONFIDENCE:
+            confident.append(lm)
+    return confident
+
+
 # Average of the wrist and the four finger base-knuckles -- a much more
 # central, stable point than the wrist alone, which sits at the very edge
 # of the hand near the arm. Grabbing/dropping felt clunky partly because
@@ -479,16 +576,34 @@ def _palm_center(hand_lm):
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
+def _joint_angle_deg(a, b, c):
+    """Angle at vertex b, between vectors b->a and b->c, in degrees. Uses
+    x/y/z (not just x/y) so a finger curling mostly in depth -- which is
+    exactly what happens when the hand is turned sideways to the camera --
+    still shows up. ~180 degrees means straight; smaller means bent."""
+    v1 = (a.x - b.x, a.y - b.y, a.z - b.z)
+    v2 = (c.x - b.x, c.y - b.y, c.z - b.z)
+    n1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2 + v1[2] ** 2)
+    n2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2 + v2[2] ** 2)
+    if n1 == 0 or n2 == 0:
+        return 180.0  # degenerate (overlapping landmarks) -- treat as straight, not curled
+    cos_angle = (v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2]) / (n1 * n2)
+    cos_angle = max(-1.0, min(1.0, cos_angle))  # guard float drift outside acos's domain
+    return math.degrees(math.acos(cos_angle))
+
+
 def _is_fist(hand_lm):
-    """A finger is curled if its tip sits closer to the wrist than its own
-    PIP joint does -- true when folded into a fist, false when extended.
-    Majority vote across the four non-thumb fingers tolerates one
-    misdetected landmark without flipping the whole classification."""
-    wrist = hand_lm[WRIST]
+    """A finger is curled if its PIP joint is bent past FIST_CURL_ANGLE_MAX_DEG
+    from straight -- true when folded into a fist, false when extended.
+    Deliberately NOT based on distance from the wrist: that depends on the
+    hand's overall position/orientation in frame (turning the hand sideways
+    changes those distances even with no actual finger movement), while a
+    joint's own bend angle only depends on its two segments relative to
+    each other. Majority vote across the four non-thumb fingers tolerates
+    one misdetected landmark without flipping the whole classification."""
     curled = 0
-    for tip_idx, pip_idx in FINGER_TIP_PIP_PAIRS:
-        tip_dist = _dist(hand_lm[tip_idx], wrist)
-        pip_dist = _dist(hand_lm[pip_idx], wrist)
-        if tip_dist < pip_dist:
+    for mcp_idx, pip_idx, tip_idx in FINGER_MCP_PIP_TIP_TRIOS:
+        angle = _joint_angle_deg(hand_lm[mcp_idx], hand_lm[pip_idx], hand_lm[tip_idx])
+        if angle <= FIST_CURL_ANGLE_MAX_DEG:
             curled += 1
     return curled >= FIST_MIN_CURLED_FINGERS

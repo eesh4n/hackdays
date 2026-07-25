@@ -181,13 +181,18 @@ def main():
                 manual_obstacle = None
                 print("[main] manual override cleared -- back to camera control")
             elif key == ord(' ') and effective_obstacle is not None:
-                client.send({
-                    "player": "B",
-                    "lane": effective_lane,
-                    "obstacle": effective_obstacle,
-                })
-                _play_place_beep()
-                print(f"[main] >> (manual) placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
+                # Goes through the same cooldown pacing as a gesture
+                # placement -- the fallback used to be able to spam
+                # instantly with zero rate limiting.
+                manual_event = tracker.try_manual_placement(effective_lane, effective_obstacle)
+                if manual_event is not None:
+                    client.send({
+                        "player": "B",
+                        "lane": manual_event["lane"],
+                        "obstacle": manual_event["obstacle_type"],
+                    })
+                    _play_place_beep()
+                    print(f"[main] >> (manual) placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
 
     finally:
         cap.release()
