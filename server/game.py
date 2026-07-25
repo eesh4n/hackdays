@@ -23,6 +23,7 @@ different action clears it:
              -> avoided only by JUMP (ducking would put you into it)
 """
 import math
+import os
 import random
 import sys
 
@@ -33,6 +34,19 @@ from ursina import (
 from ursina.shaders import lit_with_shadows_shader
 
 import actors3d
+
+# A bolder, more "HUD"-styled font for score/coins/shield text than
+# Ursina's plain default. Referenced by system path rather than bundled
+# in the repo (Windows-licensed font, not ours to redistribute) -- falls
+# back to Ursina's default automatically if this exact file isn't present
+# on a given machine, so it degrades gracefully rather than crashing.
+_HUD_FONT_WIN_PATH = "C:/Windows/Fonts/AGENCYB.TTF"
+if os.path.exists(_HUD_FONT_WIN_PATH):
+    # Panda3D's font loader wants its own drive-letter convention
+    # (/c/Windows/...), not a plain Windows path, or it fails to load it.
+    HUD_FONT = "/c/Windows/Fonts/AGENCYB.TTF"
+else:
+    HUD_FONT = None
 
 LANE_COUNT = 3
 LANE_WIDTH = 2.6
@@ -60,21 +74,34 @@ REMOVE_Z_MARGIN = 2.5   # obstacles/coins must clear the camera itself (not just
 
 TIE_COUNT = 16
 TIE_SPACING_Z = 2.2
-SCENERY_COUNT_PER_SIDE = 10
-SCENERY_SPACING_Z = 4.2
 
-BUILDING_COUNT = 22
-BUILDING_MIN_DIST = 55
-BUILDING_MAX_DIST = 110
+BUILDING_COUNT = 140
+BUILDING_MIN_DIST = 13
+BUILDING_MAX_DIST = 95
+# Height tiers, weighted so short/normal/landmark all show up mixed
+# together rather than one uniform-looking wall of towers.
+BUILDING_HEIGHT_TIERS = [
+    ("short", 0.30, (3, 8)),
+    ("normal", 0.55, (9, 32)),
+    ("landmark", 0.15, (45, 72)),
+]
+WINDOWS_PER_BUILDING_AREA = 0.55  # roughly one window per this many sq. units of facade
 STAR_COUNT = 60
 
 COIN_SPAWN_INTERVAL_MIN = 1.8
 COIN_SPAWN_INTERVAL_MAX = 3.2
 COIN_SCORE_VALUE = 25
 COIN_SPIN_SPEED = 220  # degrees/sec
-COIN_ROW_MIN = 5     # a "run" of coins in one lane, Subway-Surfers style,
-COIN_ROW_MAX = 8     # instead of one lone coin per spawn
 COIN_ROW_SPACING_Z = 1.5
+
+# Coin trail patterns -- weighted so a mix of short taps, long straight
+# runs, and side-to-side zigzags show up, Subway-Surfers style, instead
+# of always the same shape.
+COIN_PATTERN_SHORT_LEN = (2, 3)
+COIN_PATTERN_LONG_LEN = (5, 8)
+COIN_PATTERN_ZIGZAG_LEN = (6, 10)
+COIN_PATTERN_ZIGZAG_HOLD = (2, 3)  # coins per lane before the trail shifts over
+COIN_PATTERN_WEIGHTS = {"short": 3, "long": 3, "zigzag": 3}
 
 SHIELD_COIN_COST = 100    # coins required to activate a shield
 SHIELD_DURATION_SEC = 2.0  # a shield lasts a fixed 2s once activated,
@@ -87,12 +114,29 @@ GROUND_COLOR = color.rgb32(30, 28, 40)
 TRACK_COLOR = color.rgb32(46, 44, 60)
 LANE_LINE_COLOR = color.rgb32(150, 140, 190)
 TIE_COLOR = color.rgb32(70, 66, 92)
-SCENERY_COLOR = color.rgb32(35, 30, 52)
+# A varied skyline palette -- glass towers (blue/teal), concrete (warm
+# grey/brown), brick, and violet-tinted high-rises, rather than one hue
+# repeated across every building.
 BUILDING_COLORS = [
-    color.rgb32(38, 30, 58),
-    color.rgb32(48, 34, 64),
-    color.rgb32(30, 26, 50),
+    color.rgb32(64, 52, 92),    # violet
+    color.rgb32(76, 58, 104),   # lighter violet
+    color.rgb32(56, 48, 86),    # deep indigo
+    color.rgb32(50, 74, 104),   # blue glass
+    color.rgb32(56, 92, 100),   # teal glass
+    color.rgb32(92, 76, 64),    # warm concrete
+    color.rgb32(70, 76, 88),    # cool grey concrete
+    color.rgb32(84, 68, 112),   # bright violet
+    color.rgb32(104, 62, 70),   # brick red
+    color.rgb32(58, 84, 132),   # deep blue glass
+    color.rgb32(98, 90, 60),    # amber/gold-lit concrete
+    color.rgb32(72, 100, 96),   # sage/teal
 ]
+LANDMARK_COLORS = [
+    color.rgb32(100, 88, 130),
+    color.rgb32(70, 96, 140),
+    color.rgb32(120, 80, 90),
+]
+WINDOW_COLOR = color.rgba32(255, 214, 140, 235)
 HORIZON_GLOW_COLOR = color.rgba32(255, 150, 120, 60)
 STAR_COLOR = color.rgba32(230, 230, 255, 210)
 PLAYER_GLOW_COLOR = color.rgba32(80, 200, 255, 40)
@@ -186,13 +230,17 @@ class Game:
             size=window_size,
         )
         window.color = SKY_COLOR
-        # Editor UI (exit button / fps counter) only exists for a real
-        # onscreen window -- absent under window_type='none' (headless
-        # testing), so don't assume it's there.
+        # Editor UI (exit button / fps counter / entity+collider debug
+        # counters) only exists for a real onscreen window -- absent under
+        # window_type='none' (headless testing), so don't assume it's there.
         if hasattr(window, "exit_button"):
             window.exit_button.visible = False
         if hasattr(window, "fps_counter"):
             window.fps_counter.enabled = False
+        if hasattr(window, "entity_counter"):
+            window.entity_counter.enabled = False
+        if hasattr(window, "collider_counter"):
+            window.collider_counter.enabled = False
 
         self._build_scene()
         self._build_hud()
@@ -216,19 +264,58 @@ class Game:
         feel like an empty void around the track."""
         rng = random.Random(1234)  # fixed seed -- same skyline every run, not randomized noise
 
+        # The true horizon -- where the flat ground plane visually recedes
+        # to on screen -- is wherever the camera's own eye-height direction
+        # points, i.e. y == CAMERA_HEIGHT, extended out to any distance
+        # (the ray from the camera to any point at the same height it's
+        # sitting at is always exactly horizontal). Placing the glow at
+        # ground height (tried previously) was backwards; CAMERA_HEIGHT is
+        # what actually lines the road up with it, no gap.
         for i, r in enumerate((26, 20, 14, 8)):
             Entity(model="circle", color=HORIZON_GLOW_COLOR, unlit=True,
-                   billboard=True, scale=r, position=(0, 5 + i * 0.6, 140))
+                   billboard=True, scale=r, position=(0, CAMERA_HEIGHT - i * 0.15, 160))
 
-        for _ in range(BUILDING_COUNT):
-            side = rng.choice((-1, 1))
-            dist = rng.uniform(BUILDING_MIN_DIST, BUILDING_MAX_DIST)
-            depth_along_track = rng.uniform(-10, TRACK_LENGTH + 40)
-            height = rng.uniform(6, 30)
-            width = rng.uniform(4, 9)
-            Entity(model="cube", color=rng.choice(BUILDING_COLORS),
-                   scale=(width, height, width), unlit=True,
-                   position=(side * dist, height / 2 - 0.5, depth_along_track))
+        tier_names = [t[0] for t in BUILDING_HEIGHT_TIERS]
+        tier_weights = [t[1] for t in BUILDING_HEIGHT_TIERS]
+        tier_ranges = {t[0]: t[2] for t in BUILDING_HEIGHT_TIERS}
+
+        # Stratified placement (jittered grid) instead of pure uniform
+        # random -- guarantees even coverage along the track's length with
+        # no large empty gaps, rather than leaving it to chance.
+        z_min, z_max = -10, TRACK_LENGTH + 40
+        per_side = BUILDING_COUNT // 2
+        slot_size = (z_max - z_min) / per_side
+        for side in (-1, 1):
+            for slot in range(per_side):
+                dist = rng.uniform(BUILDING_MIN_DIST, BUILDING_MAX_DIST)
+                depth_along_track = z_min + slot * slot_size + rng.uniform(0, slot_size)
+
+                tier = rng.choices(tier_names, weights=tier_weights)[0]
+                height = rng.uniform(*tier_ranges[tier])
+
+                if tier == "landmark":
+                    # Taller, narrower "signature" towers standing out
+                    # above the rest of the skyline.
+                    width = rng.uniform(3, 5)
+                    building_color = rng.choice(LANDMARK_COLORS)
+                else:
+                    width = rng.uniform(3, 9) if tier == "short" else rng.uniform(4, 9)
+                    building_color = rng.choice(BUILDING_COLORS)
+                bx, by, bz = side * dist, height / 2 - 0.5, depth_along_track
+                Entity(model="cube", color=building_color,
+                       scale=(width, height, width), unlit=True, position=(bx, by, bz))
+
+                # Lit windows -- small billboarded quads scattered near the
+                # building's volume rather than placed on an exact face
+                # (the camera's viewing angle down the track varies enough
+                # that billboarding reads convincingly as "windows" from
+                # any angle, without needing per-face geometry).
+                n_windows = max(3, int(height * width * WINDOWS_PER_BUILDING_AREA / 8))
+                for _ in range(n_windows):
+                    Entity(model="quad", color=WINDOW_COLOR, unlit=True, billboard=True, scale=0.3,
+                           position=(bx + rng.uniform(-width * 0.4, width * 0.4),
+                                     by - height / 2 + rng.uniform(1, height - 1),
+                                     bz + rng.uniform(-width * 0.4, width * 0.4)))
 
         for _ in range(STAR_COUNT):
             Entity(model="circle", color=STAR_COLOR, unlit=True, billboard=True,
@@ -247,28 +334,22 @@ class Game:
             position=(0, 0, TRACK_LENGTH / 2 - 2),
             shader=lit_with_shadows_shader,
         )
+
+        self.sun = DirectionalLight(shadows=True)
+        self.sun.look_at((1, -1.4, 1.2))
+        AmbientLight(color=color.rgba32(130, 120, 150, 140))
+
         for i in (1, 2):
             Entity(model="cube", color=LANE_LINE_COLOR,
                    scale=(0.06, 0.06, TRACK_LENGTH),
                    position=((i - 1.5) * LANE_WIDTH, 0.03, TRACK_LENGTH / 2 - 2),
                    shader=lit_with_shadows_shader)
 
-        self.sun = DirectionalLight(shadows=True)
-        self.sun.look_at((1, -1.4, 1.2))
-        AmbientLight(color=color.rgba32(130, 120, 150, 140))
-
         self._ties = []
         for _ in range(TIE_COUNT):
             tie = Entity(model="cube", color=TIE_COLOR, scale=(LANE_WIDTH * LANE_COUNT * 0.98, 0.03, 0.08),
                          shader=lit_with_shadows_shader)
             self._ties.append(tie)
-
-        self._scenery = []
-        for side in (-1, 1):
-            for _ in range(SCENERY_COUNT_PER_SIDE):
-                pillar = Entity(model="cube", color=SCENERY_COLOR, scale=(0.3, 1, 0.3),
-                                shader=lit_with_shadows_shader)
-                self._scenery.append((side, pillar))
 
         self.player = actors3d.PlayerRig(position=(lane_x(1), 0, 0))
         self._glow = Entity(model="circle", color=PLAYER_GLOW_COLOR, rotation_x=90,
@@ -288,28 +369,30 @@ class Game:
 
     def _build_hud(self):
         self.score_text = Text(
-            parent=camera.ui, text="Score: 0", position=(-0.85, 0.45), scale=1.6,
-            color=color.rgb32(235, 235, 240), background=True,
+            parent=camera.ui, text="SCORE: 0", position=(-0.85, 0.45), scale=1.8,
+            color=color.rgb32(235, 235, 240), background=True, font=HUD_FONT,
         )
         self.coins_text = Text(
-            parent=camera.ui, text="Coins: 0", position=(-0.85, 0.39), scale=1.2,
-            color=color.rgb32(255, 210, 60), background=True,
+            parent=camera.ui, text="COINS: 0", position=(-0.85, 0.39), scale=1.35,
+            color=color.rgb32(255, 210, 60), background=True, font=HUD_FONT,
         )
         self.shield_text = Text(
-            parent=camera.ui, text=f"Shield: 0/{SHIELD_COIN_COST}", position=(-0.85, 0.33), scale=1.2,
-            color=color.rgb32(120, 220, 255), background=True,
+            parent=camera.ui, text="SHIELD: 0%", position=(-0.85, 0.33), scale=1.35,
+            color=color.rgb32(120, 220, 255), background=True, font=HUD_FONT,
         )
         self.warn_text = Text(
             parent=camera.ui, text="Player A pose not detected -- using last known state",
             position=(-0.85, -0.46), scale=1.0, color=color.rgb32(255, 200, 80), enabled=False,
+            font=HUD_FONT,
         )
         self.gameover_text = Text(
             parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.08),
-            scale=3.2, color=color.rgb32(255, 80, 80), enabled=False,
+            scale=3.6, color=color.rgb32(255, 80, 80), enabled=False, font=HUD_FONT,
         )
         self.hint_text = Text(
-            parent=camera.ui, text="Press R to restart, Q to quit", origin=(0, 0),
-            position=(0, -0.08), scale=1.3, color=color.rgb32(235, 235, 240), enabled=False,
+            parent=camera.ui, text="PRESS R TO RESTART, Q TO QUIT", origin=(0, 0),
+            position=(0, -0.08), scale=1.4, color=color.rgb32(235, 235, 240), enabled=False,
+            font=HUD_FONT,
         )
 
     # --- lifecycle -------------------------------------------------------
@@ -438,13 +521,38 @@ class Game:
             self._show_game_over()
 
     def _spawn_coin_row(self):
-        """A run of several coins in one lane, staggered in z so they file
-        in and get collected one after another -- the classic Subway
-        Surfers "coin trail" look, instead of one lone coin at a time."""
-        lane = random.randint(0, LANE_COUNT - 1)
-        row_len = random.randint(COIN_ROW_MIN, COIN_ROW_MAX)
-        for i in range(row_len):
-            self.coins.append(Coin(lane, z=Z_FAR + i * COIN_ROW_SPACING_Z))
+        """A trail of coins, staggered in z so they file in and get
+        collected one after another -- the classic Subway Surfers "coin
+        trail" look, instead of one lone coin at a time. Picks one of
+        three shapes each time: a short 2-3 coin tap, a longer straight
+        run, or a zigzag that walks back and forth across the lanes."""
+        pattern = random.choices(
+            list(COIN_PATTERN_WEIGHTS.keys()), weights=list(COIN_PATTERN_WEIGHTS.values())
+        )[0]
+
+        if pattern == "zigzag":
+            length = random.randint(*COIN_PATTERN_ZIGZAG_LEN)
+            lane = random.randint(0, LANE_COUNT - 1)
+            direction = random.choice((-1, 1))
+            hold = random.randint(*COIN_PATTERN_ZIGZAG_HOLD)
+            since_shift = 0
+            for i in range(length):
+                self.coins.append(Coin(lane, z=Z_FAR + i * COIN_ROW_SPACING_Z))
+                since_shift += 1
+                if since_shift >= hold:
+                    since_shift = 0
+                    hold = random.randint(*COIN_PATTERN_ZIGZAG_HOLD)
+                    next_lane = lane + direction
+                    if not 0 <= next_lane < LANE_COUNT:
+                        direction *= -1
+                        next_lane = lane + direction
+                    lane = next_lane
+        else:
+            length_range = COIN_PATTERN_SHORT_LEN if pattern == "short" else COIN_PATTERN_LONG_LEN
+            length = random.randint(*length_range)
+            lane = random.randint(0, LANE_COUNT - 1)
+            for i in range(length):
+                self.coins.append(Coin(lane, z=Z_FAR + i * COIN_ROW_SPACING_Z))
 
     def _update_coins(self, dt, speed):
         self._next_coin_spawn -= dt
@@ -534,21 +642,14 @@ class Game:
             tie.z = z
             tie.enabled = Z_NEAR - 1 <= z <= Z_FAR
 
-        scenery_phase = (self.survived_sec * speed) % SCENERY_SPACING_Z
-        for i, (side, pillar) in enumerate(self._scenery):
-            z = i * SCENERY_SPACING_Z - scenery_phase
-            pillar.z = z
-            pillar.x = side * (LANE_WIDTH * LANE_COUNT / 2 + 1.2)
-            pillar.y = 0.5
-            pillar.enabled = Z_NEAR - 1 <= z <= Z_FAR
-
     def draw(self):
-        self.score_text.text = f"Score: {int(self.score)}"
-        self.coins_text.text = f"Coins: {self.coins_collected}"
+        self.score_text.text = f"SCORE: {int(self.score)}"
+        self.coins_text.text = f"COINS: {self.coins_collected}"
         if self.shield_active:
-            self.shield_text.text = f"Shield: ACTIVE ({self.shield_timer:.1f}s)"
+            self.shield_text.text = f"SHIELD: ACTIVE ({self.shield_timer:.1f}s)"
         else:
-            self.shield_text.text = f"Shield: {self.coins_collected}/{SHIELD_COIN_COST}"
+            pct = int(100 * self.coins_collected / SHIELD_COIN_COST)
+            self.shield_text.text = f"SHIELD: {pct}%"
         self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
 
