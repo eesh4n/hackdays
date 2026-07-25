@@ -34,11 +34,13 @@ from ursina.models.procedural.cylinder import Cylinder
 from ursina.shaders import lit_with_shadows_shader
 
 HIGH_Y = 2.05
-MEDIUM_Y = 1.35  # raised from 1.05 -- at 1.05 the barrel's bottom edge
-                 # (0.775) actually overlapped the ducked torso's top edge
-                 # (0.935), so a "successfully avoided" duck still visibly
-                 # clipped through the barrel. See update_pose()'s "duck"
-                 # branch for the matching squash-depth fix.
+MEDIUM_Y = 1.45  # raised again (was 1.05, then 1.35) for a bigger safety
+                 # margin against the ducked torso's top edge -- see
+                 # update_pose()'s "duck" branch for the matching squash
+                 # tightening. At 1.05 the two actually overlapped; 1.35 left
+                 # only ~0.245 units of clearance, still too tight to call
+                 # "strict". Current gap is ~0.38 units, verified in the
+                 # geometry test suite.
 LOW_Y = 0.35
 
 OBSTACLE_COLORS = {
@@ -46,6 +48,9 @@ OBSTACLE_COLORS = {
     "medium": color.rgb32(150, 92, 52),
     "low": color.rgb32(224, 60, 60),
 }
+MEDIUM_WALL_HEIGHT = 0.55  # kept the same as the old barrel's diameter so
+                           # the validated clearance math still applies
+MEDIUM_WALL_DEPTH = 0.4
 
 COIN_Y = 1.0
 COIN_COLOR = color.rgb32(255, 210, 60)
@@ -94,15 +99,25 @@ def build_obstacle(kind, lane_width):
                       scale=(0.05, 1.15, 0.05), position=(cx, 0.9, 0))
 
     elif kind == "medium":
+        # A solid barricade wall (was a rolling barrel) -- same overall
+        # bounding box (MEDIUM_WALL_HEIGHT) as the old barrel so the
+        # validated duck/jump clearance math still applies unchanged.
         root.y = MEDIUM_Y
-        _cylinder(parent=root, color=OBSTACLE_COLORS["medium"],
-                  scale=(span, 0.55, 0.55), rotation=(0, 0, 90))
-        for bx in (-span * 0.32, 0, span * 0.32):
-            _cylinder(parent=root, color=color.rgb32(108, 64, 34),
-                      scale=(0.06, 0.57, 0.57), rotation=(0, 0, 90), position=(bx, 0, 0))
-        for cap_x in (-span * 0.48, span * 0.48):
-            _cylinder(parent=root, color=color.rgb32(100, 100, 108),
-                      scale=(0.12, 0.6, 0.6), rotation=(0, 0, 90), position=(cap_x, 0, 0))
+        _cube(parent=root, color=OBSTACLE_COLORS["medium"],
+              scale=(span, MEDIUM_WALL_HEIGHT, MEDIUM_WALL_DEPTH))
+        # hazard-stripe teeth on the front face, same treatment as high/low
+        n_teeth = max(3, int(span / 0.35))
+        for i in range(n_teeth):
+            tx = -span / 2 + (i + 0.5) * (span / n_teeth)
+            if i % 2 == 0:
+                _cube(parent=root, color=color.rgb32(35, 35, 40),
+                      scale=(span / n_teeth * 0.5, MEDIUM_WALL_HEIGHT * 0.85, MEDIUM_WALL_DEPTH + 0.02),
+                      position=(tx, 0, 0))
+        # end posts give it a barricade silhouette instead of a plain slab
+        post_w = 0.14
+        for px in (-span / 2 + post_w * 0.6, span / 2 - post_w * 0.6):
+            _cube(parent=root, color=color.rgb32(90, 90, 98),
+                  scale=(post_w, MEDIUM_WALL_HEIGHT * 1.2, MEDIUM_WALL_DEPTH * 1.3), position=(px, 0, 0))
 
     else:  # "low"
         root.y = LOW_Y
@@ -188,13 +203,13 @@ class PlayerRig(Entity):
             self.left_leg.rotation = (0, 0, 0)
             self.right_leg.rotation = (0, 0, 0)
         elif action == "duck":
-            # 0.4 (was 0.55) -- at 0.55 the ducked torso's top edge (0.935)
-            # still overlapped the medium obstacle's bottom edge (0.775 at
-            # the old MEDIUM_Y), so a duck that correctly avoided the hit
-            # per the rule table still visibly clipped through the barrel.
-            self.torso.scale = (0.85, TORSO_HEIGHT * 0.4, 0.55)
-            self.torso.y = HIP_Y + TORSO_HEIGHT * 0.4 / 2
-            self.head.y = self.torso.y + TORSO_HEIGHT * 0.4 / 2 + 0.2
+            # 0.35 (was 0.55, then 0.4) -- squashed further each time a
+            # visible overlap with the medium obstacle's bottom edge turned
+            # up. Current gap is ~0.38 units, verified in the geometry test
+            # suite rather than eyeballed.
+            self.torso.scale = (0.85, TORSO_HEIGHT * 0.35, 0.55)
+            self.torso.y = HIP_Y + TORSO_HEIGHT * 0.35 / 2
+            self.head.y = self.torso.y + TORSO_HEIGHT * 0.35 / 2 + 0.2
             self.left_arm.rotation = (-100, 0, 0)
             self.right_arm.rotation = (-100, 0, 0)
             self.left_leg.rotation = (20, 0, 0)

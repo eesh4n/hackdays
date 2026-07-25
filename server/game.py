@@ -95,6 +95,12 @@ COIN_SCORE_VALUE = 25
 COIN_SPIN_SPEED = 220  # degrees/sec
 COIN_ROW_SPACING_Z = 1.5
 
+# Obstacles/coins drop in from above instead of just appearing at their
+# resting height -- purely a spawn-in visual, doesn't touch their z motion
+# (which starts moving toward the player immediately, same as before).
+FALL_IN_HEIGHT = 7.0
+FALL_IN_DURATION = 0.5
+
 # Coin trail patterns -- weighted so a mix of short taps, long straight
 # runs, and side-to-side zigzags show up, Subway-Surfers style, instead
 # of always the same shape.
@@ -228,6 +234,13 @@ class Obstacle:
         self.entity.z = self.z
         self.resolved = False  # has this obstacle already had its hit/avoid check?
 
+        # Falls in from above instead of just appearing -- build_obstacle()
+        # already set entity.y to its correct resting height, so lift it up
+        # from there and animate back down onto that same spot.
+        resting_y = self.entity.y
+        self.entity.y = resting_y + FALL_IN_HEIGHT
+        self.entity.animate_y(resting_y, duration=FALL_IN_DURATION, curve=curve.out_bounce)
+
     def sync_transform(self):
         self.entity.z = self.z
 
@@ -250,6 +263,10 @@ class Coin:
         self.entity.x = lane_x(lane)
         self.entity.z = self.z
         self.resolved = False
+
+        resting_y = self.entity.y
+        self.entity.y = resting_y + FALL_IN_HEIGHT
+        self.entity.animate_y(resting_y, duration=FALL_IN_DURATION, curve=curve.out_bounce)
 
     def sync_transform(self, dt):
         self.entity.z = self.z
