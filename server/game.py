@@ -12,21 +12,23 @@ the collision plane, Z_FAR = the horizon where obstacles spawn).
 Everything -- lane x-position, obstacle size, vertical high/low offset,
 the road cross-ties -- is scaled by the same `scale(z)` projection
 factor, so the whole scene converges toward one vanishing point instead
-of each element being faked independently.
+of each element being faked independently. Obstacle and player art
+itself is procedurally drawn vector art (sprites.py), not flat blocks.
 
 Obstacle avoidance rules (the actual "game logic" B is trying to beat A
-with):
-    "high"   obstacle sits up high (like a bar across the lane)
-             -> avoided only by DUCK
-    "low"    obstacle sits on the ground (like a hurdle)
-             -> avoided only by JUMP
-    "medium" obstacle fills the whole lane height
-             -> can't be avoided by jump or duck at all -- the only
-                escape is not being in that lane when it arrives
-This gives B two ways to threaten A: force a reflex check (high/low) or
-force a lane change (medium).
+with) -- each type sits at a different height, so a different action
+clears it:
+    "high"   a beam hanging from the roof, near the top of the lane
+             -> avoided only by DUCK (jumping would put you into it)
+    "medium" a chest-height roller barrel, centered in the lane
+             -> avoided by EITHER jump or duck (low enough to clear by
+                jumping, high enough to clear by ducking)
+    "low"    a ground-level hurdle
+             -> avoided only by JUMP (ducking would put you into it)
 """
 import pygame
+
+import sprites
 
 SCREEN_W, SCREEN_H = 900, 600
 LANE_COUNT = 3
@@ -99,25 +101,31 @@ OBSTACLE_WORLD_SPEED_RAMP = 0.09   # added per second survived
 COLLISION_Z_BAND = 0.9             # world-units window around Z_NEAR to check a hit
 REMOVE_Z = -1.5                    # obstacle fully passed the player, stop drawing/tracking it
 
-NEAR_OBSTACLE_HEIGHT_PX = {"high": 40, "medium": 90, "low": 34}
-NEAR_OBSTACLE_Y_OFFSET_PX = {"high": -85, "medium": 0, "low": 55}  # from lane centerline, at z=0
+# Obstacle vertical placement, at z=0 (right in front of the player):
+# height of the sprite, and its offset from the lane centerline.
+# high sits near the top of the lane (duck under it), low sits near the
+# ground (jump over it), medium is centered at chest height (clearable
+# either way).
+NEAR_OBSTACLE_HEIGHT_PX = {"high": 46, "medium": 42, "low": 40}
+NEAR_OBSTACLE_Y_OFFSET_PX = {"high": -80, "medium": 0, "low": 58}
 MIN_OBSTACLE_PX = 6
 OBSTACLE_WIDTH_FRACTION = 0.72  # of the lane's width at that depth
 
-SKY_COLOR = (14, 14, 22)
+SKY_TOP_COLOR = (18, 14, 42)
+SKY_BOTTOM_COLOR = (64, 40, 74)
 GROUND_COLOR = (26, 24, 34)
-TRACK_COLOR = (40, 38, 52)
-TRACK_EDGE_COLOR = (90, 88, 110)
-LANE_LINE_COLOR = (70, 68, 88)
-TIE_COLOR = (55, 53, 70)
-PLAYER_COLOR = (80, 200, 255)
-PLAYER_SHADE_COLOR = (45, 130, 175)
+TRACK_COLOR = (42, 40, 55)
+TRACK_EDGE_COLOR = (120, 110, 150)
+LANE_LINE_COLOR = (90, 85, 115)
+TIE_COLOR = (60, 56, 78)
+SCENERY_COLOR = (30, 26, 44)
+HORIZON_GLOW_COLOR = (255, 170, 120)
 GAMEOVER_COLOR = (255, 80, 80)
-OBSTACLE_COLORS = {"high": (255, 180, 60), "medium": (200, 80, 220), "low": (255, 90, 90)}
-TEXT_COLOR = (230, 230, 230)
+TEXT_COLOR = (235, 235, 240)
+PANEL_COLOR = (20, 18, 30, 170)
 
 ROAD_TIE_SPACING_Z = 2.2
-ROAD_TIE_COUNT = 10
+SCENERY_SPACING_Z = 4.5
 
 
 def avoided(action, obstacle_kind):
@@ -125,7 +133,9 @@ def avoided(action, obstacle_kind):
         return action == "duck"
     if obstacle_kind == "low":
         return action == "jump"
-    return False  # "medium" is never avoided by an action, only by lane
+    if obstacle_kind == "medium":
+        return action in ("jump", "duck")
+    return False
 
 
 class Obstacle:
@@ -155,6 +165,8 @@ class Game:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont(None, 32)
         self.big_font = pygame.font.SysFont(None, 64)
+
+        self._sky = sprites.build_vertical_gradient(SCREEN_W, HORIZON_Y + 2, SKY_TOP_COLOR, SKY_BOTTOM_COLOR)
 
         self._lane_a = 1
         self._action_a = "run"
@@ -216,37 +228,50 @@ class Game:
 
         # Obstacles farthest-first so nearer ones draw on top (painter's algorithm).
         for obstacle in sorted(self.obstacles, key=lambda o: -o.z):
-            pygame.draw.rect(self.screen, OBSTACLE_COLORS[obstacle.kind], obstacle.rect(), border_radius=4)
+            rect = obstacle.rect()
+            sprite = sprites.get_obstacle_sprite(obstacle.kind, rect.width, rect.height)
+            self.screen.blit(sprite, rect.topleft)
 
         self._draw_player()
-
-        score_surf = self.font.render(f"Score: {int(self.score)}", True, TEXT_COLOR)
-        self.screen.blit(score_surf, (10, 10))
-
-        if not self._pose_visible_a:
-            warn = self.font.render("Player A pose not detected -- using last known state", True, (255, 200, 80))
-            self.screen.blit(warn, (10, SCREEN_H - 30))
+        self._draw_hud()
 
         if self.game_over:
-            over_surf = self.big_font.render("GAME OVER", True, GAMEOVER_COLOR)
-            hint_surf = self.font.render("Press R to restart, Q to quit", True, TEXT_COLOR)
-            self.screen.blit(over_surf, over_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 20)))
-            self.screen.blit(hint_surf, hint_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 30)))
+            self._draw_game_over()
 
     def _draw_scene(self):
-        self.screen.fill(SKY_COLOR)
+        self.screen.blit(self._sky, (0, 0))
         pygame.draw.rect(self.screen, GROUND_COLOR, (0, HORIZON_Y, SCREEN_W, SCREEN_H - HORIZON_Y))
 
-        # Track surface: a trapezoid from the horizon down to the near edge.
+        # Soft glow behind the vanishing point for atmosphere.
+        glow_r = 90
+        glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
+        for r in range(glow_r, 0, -6):
+            alpha = int(50 * (1 - r / glow_r))
+            pygame.draw.circle(glow, (*HORIZON_GLOW_COLOR, alpha), (glow_r, glow_r), r)
+        self.screen.blit(glow, (SCREEN_W // 2 - glow_r, HORIZON_Y - glow_r), special_flags=pygame.BLEND_RGBA_ADD)
+
+        self._draw_scenery()
+
         far_l, far_r = lane_boundary_x(0, Z_FAR), lane_boundary_x(LANE_COUNT, Z_FAR)
         near_l, near_r = lane_boundary_x(0, Z_NEAR), lane_boundary_x(LANE_COUNT, Z_NEAR)
         pygame.draw.polygon(self.screen, TRACK_COLOR, [
             (far_l, HORIZON_Y), (far_r, HORIZON_Y), (near_r, NEAR_Y), (near_l, NEAR_Y),
         ])
-        pygame.draw.line(self.screen, TRACK_EDGE_COLOR, (far_l, HORIZON_Y), (near_l, NEAR_Y), 2)
-        pygame.draw.line(self.screen, TRACK_EDGE_COLOR, (far_r, HORIZON_Y), (near_r, NEAR_Y), 2)
+        pygame.draw.line(self.screen, TRACK_EDGE_COLOR, (far_l, HORIZON_Y), (near_l, NEAR_Y), 3)
+        pygame.draw.line(self.screen, TRACK_EDGE_COLOR, (far_r, HORIZON_Y), (near_r, NEAR_Y), 3)
 
-        # Lane divider lines, converging toward the horizon.
+        # Soft highlight glow under the player's current lane -- makes it
+        # obvious at a glance which lane is "yours".
+        cur_l = lane_boundary_x(self._lane_a, Z_NEAR)
+        cur_r = lane_boundary_x(self._lane_a + 1, Z_NEAR)
+        cur_fl = lane_boundary_x(self._lane_a, Z_FAR * 0.35)
+        cur_fr = lane_boundary_x(self._lane_a + 1, Z_FAR * 0.35)
+        glow_poly = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        pygame.draw.polygon(glow_poly, (80, 200, 255, 35), [
+            (cur_fl, screen_y(Z_FAR * 0.35)), (cur_fr, screen_y(Z_FAR * 0.35)), (cur_r, NEAR_Y), (cur_l, NEAR_Y),
+        ])
+        self.screen.blit(glow_poly, (0, 0))
+
         for i in (1, 2):
             pygame.draw.line(
                 self.screen, LANE_LINE_COLOR,
@@ -271,6 +296,25 @@ class Game:
                 pygame.draw.line(self.screen, TIE_COLOR, (l, y), (r, y), 1)
             z += ROAD_TIE_SPACING_Z
 
+    def _draw_scenery(self):
+        """Simple converging pillars along both sides of the track so
+        the world doesn't feel like an empty void off-track."""
+        speed = OBSTACLE_WORLD_SPEED_START + OBSTACLE_WORLD_SPEED_RAMP * self.survived_sec
+        phase = (self.survived_sec * speed) % SCENERY_SPACING_Z
+        z = -phase
+        while z <= Z_FAR:
+            if z >= Z_NEAR:
+                t = _norm(z)
+                y = screen_y(z)
+                pillar_h = _lerp(6, 70, t)
+                pillar_w = _lerp(3, 18, t)
+                margin = _lerp(4, 30, t)
+                for side_x in (lane_boundary_x(0, z) - margin, lane_boundary_x(LANE_COUNT, z) + margin):
+                    rect = pygame.Rect(0, 0, pillar_w, pillar_h)
+                    rect.midbottom = (side_x, y)
+                    pygame.draw.rect(self.screen, SCENERY_COLOR, rect, border_radius=2)
+            z += SCENERY_SPACING_Z
+
     def _draw_player(self):
         x = lane_center_x(self._lane_a, Z_NEAR)
         base_y = NEAR_Y
@@ -285,12 +329,38 @@ class Game:
             size = PLAYER_SIZE
             y = base_y
 
-        # A short shaded "shadow" block behind the main body reads as a
-        # cheap sense of depth/thickness without needing real 3D geometry.
-        shade = pygame.Rect(0, 0, size, size)
-        shade.center = (x + 6, y + 6)
-        pygame.draw.rect(self.screen, PLAYER_SHADE_COLOR, shade, border_radius=8)
+        # Ground shadow stays on the track regardless of jump height --
+        # reads as "how far off the ground you currently are".
+        shadow_w = PLAYER_SIZE * 1.05
+        shadow_h = PLAYER_SIZE * 0.24
+        shadow = pygame.Surface((int(shadow_w), int(shadow_h)), pygame.SRCALPHA)
+        pygame.draw.ellipse(shadow, (0, 0, 0, 90), shadow.get_rect())
+        self.screen.blit(shadow, (x - shadow_w / 2, base_y + PLAYER_SIZE * 0.32 - shadow_h / 2))
 
-        rect = pygame.Rect(0, 0, size, size)
-        rect.center = (x, y)
-        pygame.draw.rect(self.screen, PLAYER_COLOR, rect, border_radius=8)
+        sprites.draw_player(self.screen, x, y, size, self._action_a)
+
+    def _draw_hud(self):
+        panel = pygame.Surface((190, 46), pygame.SRCALPHA)
+        pygame.draw.rect(panel, PANEL_COLOR, panel.get_rect(), border_radius=10)
+        self.screen.blit(panel, (10, 10))
+        score_surf = self.font.render(f"Score: {int(self.score)}", True, TEXT_COLOR)
+        self.screen.blit(score_surf, (24, 22))
+
+        if not self._pose_visible_a:
+            warn = self.font.render("Player A pose not detected -- using last known state", True, (255, 200, 80))
+            self.screen.blit(warn, (10, SCREEN_H - 30))
+
+    def _draw_game_over(self):
+        dim = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 120))
+        self.screen.blit(dim, (0, 0))
+
+        panel = pygame.Surface((360, 140), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (20, 18, 30, 210), panel.get_rect(), border_radius=16)
+        pygame.draw.rect(panel, GAMEOVER_COLOR, panel.get_rect(), width=2, border_radius=16)
+        self.screen.blit(panel, (SCREEN_W // 2 - 180, SCREEN_H // 2 - 70))
+
+        over_surf = self.big_font.render("GAME OVER", True, GAMEOVER_COLOR)
+        hint_surf = self.font.render("Press R to restart, Q to quit", True, TEXT_COLOR)
+        self.screen.blit(over_surf, over_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 - 20)))
+        self.screen.blit(hint_surf, hint_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2 + 30)))
