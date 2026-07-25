@@ -433,6 +433,13 @@ class Game:
             parent=camera.ui, text="TRACKING LOST", position=(-0.85, -0.46), scale=0.9,
             color=color.rgb32(255, 120, 120), background=True, enabled=False, font=HUD_FONT,
         )
+        # Positioned below the shared HUD panel (which ends around y=0.16)
+        # rather than at the original y=0.27, which used to land right on
+        # top of the shield text/bar added alongside it.
+        self.jump_duck_debug_text = Text(
+            parent=camera.ui, text="", position=(-0.85, 0.15), scale=0.9,
+            color=color.rgb32(180, 180, 190), background=True,
+        )
 
         self.gameover_text = Text(
             parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.2),
@@ -821,6 +828,11 @@ class Game:
             self.shield_bar_fill.scale_x = max(0.001, SHIELD_BAR_WIDTH * pct)
         self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
+
+        delta, jump_threshold, duck_threshold = self.game_state.get_player_a_debug()
+        self.jump_duck_debug_text.text = (
+            f"delta: {delta:+.2f}  (jump<-{jump_threshold:.2f}  duck>{duck_threshold:.2f})"
+        )
 
     def _show_game_over(self):
         self.gameover_text.enabled = True

@@ -31,6 +31,14 @@ class GameState:
         self._action_a = "run"
         self._pose_visible_a = False
 
+        # Jump/duck debug numbers (see jump_duck_detector.py) -- not
+        # gameplay state, just surfaced so the live delta/thresholds
+        # driving detection can be read off the game's own HUD while
+        # tuning sensitivity, not only the separate debug camera window.
+        self._delta_a = 0.0
+        self._jump_threshold_a = 0.0
+        self._duck_threshold_a = 0.0
+
         # Pending obstacle placements from Player B, written by the
         # websocket server thread. game.py drains this every frame --
         # it's a queue, not a single value, since B can place faster than
@@ -56,6 +64,16 @@ class GameState:
     def get_player_a(self):
         with self._lock:
             return self._lane_a, self._action_a, self._pose_visible_a
+
+    def set_player_a_debug(self, delta, jump_threshold, duck_threshold):
+        with self._lock:
+            self._delta_a = delta
+            self._jump_threshold_a = jump_threshold
+            self._duck_threshold_a = duck_threshold
+
+    def get_player_a_debug(self):
+        with self._lock:
+            return self._delta_a, self._jump_threshold_a, self._duck_threshold_a
 
     # --- Player B spawn events ------------------------------------------
 
