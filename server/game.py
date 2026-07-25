@@ -405,6 +405,10 @@ class Game:
             position=(-0.85, -0.46), scale=1.0, color=color.rgb32(255, 200, 80), enabled=False,
             font=HUD_FONT,
         )
+        self.jump_duck_debug_text = Text(
+            parent=camera.ui, text="", position=(-0.85, 0.27), scale=0.9,
+            color=color.rgb32(180, 180, 190), background=True,
+        )
         self.gameover_text = Text(
             parent=camera.ui, text="GAME OVER", origin=(0, 0), position=(0, 0.08),
             scale=3.6, color=color.rgb32(255, 80, 80), enabled=False, font=HUD_FONT,
@@ -744,6 +748,11 @@ class Game:
             self.shield_text.text = f"SHIELD: {pct}%"
         self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
+
+        delta, jump_threshold, duck_threshold = self.game_state.get_player_a_debug()
+        self.jump_duck_debug_text.text = (
+            f"delta: {delta:+.2f}  (jump<-{jump_threshold:.2f}  duck>{duck_threshold:.2f})"
+        )
 
     def _show_game_over(self):
         self.gameover_text.enabled = True

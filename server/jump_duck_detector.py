@@ -16,9 +16,13 @@ calibration (server/motion_log_small_jumps.csv, motion_log_small_ducks.csv --
 isolated jump-only and duck-only sessions, deliberately minimal-effort
 movements) found: quick jumps land at -0.42x torso_len or beyond, quick
 ducks at +0.12x to +0.54x (most clustering above +0.24x), and true
-standing noise stays within +-0.09x. Thresholds sit at roughly 2x the
-noise floor -- comfortably below real quick movements, comfortably
-above jitter.
+standing noise stays within +-0.09x. Thresholds sit at roughly 1.5x the
+noise floor -- tighter than the original 2x margin, trading a little
+false-positive risk for a lot more reflex sensitivity, since in-game
+testing found 2x still too hard to trigger reliably for a quick reaction.
+The live delta and these thresholds are surfaced on-screen (both the
+debug camera window and the game HUD) specifically so this can keep
+being tuned by eye without needing another full recording session.
 
 The very first frame is NOT used as the baseline outright -- if it
 catches the player mid-motion or not yet settled, every future delta
@@ -28,9 +32,9 @@ WARMUP_FRAMES frames fast-converge the baseline (higher alpha) before
 detection turns on.
 """
 
-JUMP_THRESHOLD = 0.20
-DUCK_THRESHOLD = 0.18
-RETURN_THRESHOLD = 0.12
+JUMP_THRESHOLD = 0.14
+DUCK_THRESHOLD = 0.13
+RETURN_THRESHOLD = 0.09
 BASELINE_ALPHA = 0.05
 
 WARMUP_FRAMES = 15
@@ -52,6 +56,18 @@ class JumpDuckDetector:
         self.state = "neutral"  # "neutral", "jump", "duck"
         self.last_normalized_delta = 0.0  # exposed for debug overlays
 
+        self._warmup_frames_left = WARMUP_FRAMES
+
+    def reset(self):
+        """Clears the baseline so the next update() call re-arms from
+        scratch (fresh warmup included) -- call this when a person first
+        appears in frame, so delta starts at 0 for them instead of being
+        measured against whoever (or wherever) was last tracked before
+        they left."""
+        self.baseline_hip_y = None
+        self.baseline_torso_len = None
+        self.state = "neutral"
+        self.last_normalized_delta = 0.0
         self._warmup_frames_left = WARMUP_FRAMES
 
     def update(self, hip_y, torso_len):

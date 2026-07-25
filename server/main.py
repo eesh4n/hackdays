@@ -87,6 +87,7 @@ def run_camera_tracker(game_state, camera_index, stop_event):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = tracker.process_frame(rgb)
             game_state.set_player_a(result["lane"], result["action"], result["pose_visible"])
+            game_state.set_player_a_debug(result["delta"], result["jump_threshold"], result["duck_threshold"])
 
             tracker.debug_overlay(frame)
             cv2.imshow("Player A (runner) -- debug", frame)

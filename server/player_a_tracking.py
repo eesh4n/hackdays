@@ -125,7 +125,13 @@ class PlayerATracker:
     def process_frame(self, rgb_frame):
         """rgb_frame: HxWx3 RGB numpy array (already flipped/converted by caller).
 
-        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"|"block"}
+        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"|"block",
+                  "delta": float, "jump_threshold": float, "duck_threshold": float}
+        `delta` is the live jump/duck signal (see jump_duck_detector.py) --
+        negative crossing -jump_threshold fires a jump, positive crossing
+        duck_threshold fires a duck. Exposed so callers (main.py's debug
+        window, game.py's HUD) can show players the actual numbers driving
+        detection, not just the resulting action.
         """
         _, w = rgb_frame.shape[:2]
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -138,6 +144,13 @@ class PlayerATracker:
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
 
         if result.pose_landmarks:
+            if not self.pose_visible:
+                # Someone just arrived at the screen (first detection ever,
+                # or stepped back into frame after leaving) -- re-arm the
+                # detector so delta starts at 0 for them instead of being
+                # measured against a stale baseline from before they left.
+                self._detector.reset()
+                self._is_blocking = False
             self.pose_visible = True
             landmarks = result.pose_landmarks[0]  # first detected person
             self._last_landmarks = landmarks
@@ -168,6 +181,9 @@ class PlayerATracker:
             "pose_visible": self.pose_visible,
             "lane": self.lane,
             "action": self.action,
+            "delta": self._detector.last_normalized_delta,
+            "jump_threshold": self._detector.jump_threshold,
+            "duck_threshold": self._detector.duck_threshold,
         }
 
     def debug_overlay(self, frame):
