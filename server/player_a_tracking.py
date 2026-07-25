@@ -125,13 +125,7 @@ class PlayerATracker:
     def process_frame(self, rgb_frame):
         """rgb_frame: HxWx3 RGB numpy array (already flipped/converted by caller).
 
-        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"|"block",
-                  "delta": float, "jump_threshold": float, "duck_threshold": float}
-        `delta` is the live jump/duck signal (see jump_duck_detector.py) --
-        negative crossing -jump_threshold fires a jump, positive crossing
-        duck_threshold fires a duck. Exposed so callers (main.py's debug
-        window, game.py's HUD) can show players the actual numbers driving
-        detection, not just the resulting action.
+        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"|"block"}
         """
         _, w = rgb_frame.shape[:2]
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -181,9 +175,6 @@ class PlayerATracker:
             "pose_visible": self.pose_visible,
             "lane": self.lane,
             "action": self.action,
-            "delta": self._detector.last_normalized_delta,
-            "jump_threshold": self._detector.jump_threshold,
-            "duck_threshold": self._detector.duck_threshold,
         }
 
     def debug_overlay(self, frame):
@@ -214,13 +205,6 @@ class PlayerATracker:
         cv2.putText(
             frame, f"action: {self.action}", (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, action_color, 2, cv2.LINE_AA
-        )
-        delta = self._detector.last_normalized_delta
-        cv2.putText(
-            frame,
-            f"delta: {delta:+.2f}  (jump < -{self._detector.jump_threshold:.2f}, "
-            f"duck > {self._detector.duck_threshold:.2f})",
-            (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA
         )
         return frame
 

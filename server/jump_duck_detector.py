@@ -20,9 +20,6 @@ standing noise stays within +-0.09x. Thresholds sit at roughly 1.5x the
 noise floor -- tighter than the original 2x margin, trading a little
 false-positive risk for a lot more reflex sensitivity, since in-game
 testing found 2x still too hard to trigger reliably for a quick reaction.
-The live delta and these thresholds are surfaced on-screen (both the
-debug camera window and the game HUD) specifically so this can keep
-being tuned by eye without needing another full recording session.
 
 The very first frame is NOT used as the baseline outright -- if it
 catches the player mid-motion or not yet settled, every future delta

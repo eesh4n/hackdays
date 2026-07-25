@@ -5,13 +5,16 @@ Opens the webcam, runs the lane + grab/place tracker, and sends a
 placement event over WebSocket to the game host every time Player B grabs
 a generic object from the top GRAB strip (fist closes) and releases it
 (fist opens) inside one of the three large LOW/MEDIUM/HIGH drop zones
-below -- the drop zone decides the type, not the grab location. A short
-beep confirms each placement locally, independent of whether the network
-delivery actually succeeds. Also draws a debug preview window (grab
-strip, drop zones, lane, hand/fist state, last-successful-send age) so
-you can see what's being tracked live -- worth leaving on even during the
-real demo, just moved off to the side, since it's the fastest way to tell
-if tracking is misbehaving before a judge notices.
+below -- the drop zone decides the type, not the grab location. Both
+hands work independently and simultaneously, each with its own cooldown,
+so alternating hands lets you place obstacles back-to-back without
+waiting on a single shared timer. A short beep confirms each placement
+locally, independent of whether the network delivery actually succeeds.
+Also draws a debug preview window (grab strip, drop zones, lane, both
+hands' state, last-successful-send age) so you can see what's being
+tracked live -- worth leaving on even during the real demo, just moved
+off to the side, since it's the fastest way to tell if tracking is
+misbehaving before a judge notices.
 
 Usage:
     python main.py <server_ip> [--port 8765] [--camera 0]
@@ -74,6 +77,18 @@ def main():
         print(f"FAIL: could not open camera index {args.camera}")
         print("  -> try a different --camera index, or check Windows camera privacy settings")
         sys.exit(1)
+    # Many webcams default to 720p/1080p, which means real per-frame cost
+    # (color conversion, resize into the model's input tensor) on top of
+    # the model inference itself. Capping capture resolution cuts that
+    # overhead directly; cv2 falls back to the nearest supported mode if
+    # the camera can't do exactly this, so this is safe to request blind.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # DSHOW will often "accept" any FPS you request without validating the
+    # hardware can actually deliver it -- this is a request, not a
+    # guarantee. Whether it did anything is only knowable from the live
+    # fps counter on screen, not from what cv2 reports back here.
+    cap.set(cv2.CAP_PROP_FPS, 60)
 
     tracker = PlayerBTracker()
     client = WebSocketClient(args.server_ip, port=args.port)
@@ -92,12 +107,26 @@ def main():
     manual_lane = None
     manual_obstacle = None
 
+    # Rolling FPS counter -- measures the ACTUAL achieved rate so any
+    # tuning (resolution, pose-sample interval, etc.) can be judged against
+    # a real number instead of guessed at.
+    fps_frame_count = 0
+    fps_window_start = time.time()
+    current_fps = 0.0
+
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 print("[main] FAIL: camera frame read failed")
                 break
+
+            fps_frame_count += 1
+            fps_elapsed = time.time() - fps_window_start
+            if fps_elapsed >= 1.0:
+                current_fps = fps_frame_count / fps_elapsed
+                fps_frame_count = 0
+                fps_window_start = time.time()
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -111,15 +140,17 @@ def main():
             # must be set via h/m/l first).
             effective_obstacle = manual_obstacle
 
-            if result["event"] is not None:
+            # A list, not a single optional event -- both hands can each
+            # fire a placement on the same frame.
+            for event in result["events"]:
                 client.send({
                     "player": "B",
-                    "lane": result["event"]["lane"],
-                    "obstacle": result["event"]["obstacle_type"],
+                    "lane": event["lane"],
+                    "obstacle": event["obstacle_type"],
                 })
                 _play_place_beep()
-                print(f"[main] >> placed {result['event']['obstacle_type']} obstacle "
-                      f"in lane {LANE_NAMES[result['event']['lane']]}")
+                print(f"[main] >> placed {event['obstacle_type']} obstacle "
+                      f"in lane {LANE_NAMES[event['lane']]}")
 
             tracker.debug_overlay(frame)
 
@@ -149,6 +180,10 @@ def main():
             if manual_lane is not None or manual_obstacle is not None:
                 cv2.putText(frame, "MANUAL OVERRIDE", (right_x, frame.shape[0] - 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+            fps_color = (0, 255, 0) if current_fps >= 20 else ((0, 165, 255) if current_fps >= 12 else (0, 0, 255))
+            cv2.putText(frame, f"fps: {current_fps:.1f}", (right_x, frame.shape[0] - 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, fps_color, 2)
 
             cv2.imshow(WINDOW_NAME, frame)
 
