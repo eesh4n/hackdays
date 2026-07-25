@@ -37,6 +37,12 @@ class GameState:
         # the render loop ticks and no placement should be silently lost.
         self._spawn_queue = []
 
+        # Pending shield-activation requests from Player B (a distinct
+        # message shape over the same websocket -- see push_shield_request).
+        # game.py decides whether to actually honor one (needs >=100 coins
+        # banked, and won't stack a second activation on an active shield).
+        self._shield_queue = []
+
     # --- Player A -----------------------------------------------------
 
     def set_player_a(self, lane, action, pose_visible=True):
@@ -80,9 +86,34 @@ class GameState:
             events, self._spawn_queue = self._spawn_queue, []
         return events
 
+    # --- Player B shield-activation requests ----------------------------
+
+    def push_shield_request(self, message: dict):
+        """Called from the websocket server with a decoded JSON message
+        of the shape {"player": "B", "action": "shield"} -- a distinct
+        message type from obstacle placement. Whether it actually
+        activates a shield (enough coins banked, not already active) is
+        game.py's decision, not this layer's -- this only validates the
+        network message itself."""
+        if message.get("player") != "B" or message.get("action") != "shield":
+            return False
+        with self._lock:
+            self._shield_queue.append({
+                "seq": message.get("seq"),
+                "sent_at": message.get("sent_at"),
+                "received_at": time.time(),
+            })
+        return True
+
+    def drain_shield_requests(self):
+        with self._lock:
+            requests, self._shield_queue = self._shield_queue, []
+        return requests
+
     def reset(self):
         with self._lock:
             self._lane_a = 1
             self._action_a = "run"
             self._pose_visible_a = False
             self._spawn_queue = []
+            self._shield_queue = []

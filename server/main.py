@@ -22,6 +22,11 @@ keyboard control (LEFT/RIGHT or A/D = change lane, SPACE = jump,
 DOWN or S = duck) -- useful for testing game.py and the websocket server
 without a working camera or pose model on hand.
 
+E activates the shield (same >=100-coins / no-stacking rules as a real
+shield-activation message from Player B) -- available regardless of
+--no-camera, as a manual stand-in/demo fallback if Player B's shield
+gesture isn't wired up on their end yet.
+
 --windowed disables fullscreen (dev/debug use). By default the window
 goes fullscreen at the display's native resolution, which is the right
 behavior for a monitor that's been physically rotated to portrait via
@@ -113,6 +118,7 @@ def main():
     else:
         print("[main] --no-camera: Player A control is keyboard-only "
               "(LEFT/RIGHT = lane, SPACE = jump, DOWN = duck)")
+    print("[main] E = activate shield (manual stand-in for Player B's shield gesture)")
 
     window_size = (1080, 1920) if args.portrait else None
     fullscreen = not args.windowed and not args.portrait

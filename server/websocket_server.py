@@ -8,9 +8,13 @@ pygame loop in game.py is a plain synchronous while-loop, so networking
 needs to live on its own thread with its own event loop rather than
 forcing the whole game onto asyncio.
 
-Protocol (see client/player_b_tracker.py and client/main.py):
-    {"player": "B", "lane": 0|1|2, "obstacle": "high"|"medium"|"low",
-     "seq": int, "sent_at": float}
+Protocol (see client/player_b_tracker.py and client/main.py) -- two
+message shapes, routed by which keys are present:
+    Obstacle placement:
+        {"player": "B", "lane": 0|1|2, "obstacle": "high"|"medium"|"low",
+         "seq": int, "sent_at": float}
+    Shield activation:
+        {"player": "B", "action": "shield", "seq": int, "sent_at": float}
 Fire-and-forget from B's side -- no ack is sent back, and delivery isn't
 guaranteed (B's client drops messages if its send queue overflows while
 disconnected). The game doesn't need to reply for any of this to work.
@@ -76,7 +80,10 @@ class WebSocketServer:
                     continue
                 if not isinstance(message, dict) or message.get("player") != "B":
                     continue
-                self.game_state.push_spawn_event(message)
+                if message.get("action") == "shield":
+                    self.game_state.push_shield_request(message)
+                else:
+                    self.game_state.push_spawn_event(message)
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
