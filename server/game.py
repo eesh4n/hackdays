@@ -284,7 +284,7 @@ class Game:
         self._kb_lane = 1
 
         self.app = Ursina(
-            title="Hackdays -- Player A vs Player B",
+            title="RivalRuns -- Player A vs Player B",
             borderless=False,
             fullscreen=fullscreen and window_size is None,
             size=window_size,
@@ -492,7 +492,7 @@ class Game:
             parent=camera.ui, text="Rival", origin=(0.5, 0), position=(-0.01, 0.05),
             scale=6.0, color=color.rgb32(230, 55, 55), font=HUD_FONT, enabled=False,
         )
-        self.intro_refs_text = Text(
+        self.intro_runs_text = Text(
             parent=camera.ui, text="Runs", origin=(-0.5, 0), position=(0.01, 0.05),
             scale=6.0, color=color.rgb32(70, 140, 235), font=HUD_FONT, enabled=False,
         )
@@ -622,13 +622,13 @@ class Game:
         self.countdown_text.enabled = False
 
         self.intro_rival_text.x = -0.01 - INTRO_OFFSCREEN_OFFSET
-        self.intro_refs_text.x = 0.01 + INTRO_OFFSCREEN_OFFSET
+        self.intro_runs_text.x = 0.01 + INTRO_OFFSCREEN_OFFSET
         self.intro_rival_text.color = color.rgba32(230, 55, 55, 255)
-        self.intro_refs_text.color = color.rgba32(70, 140, 235, 255)
+        self.intro_runs_text.color = color.rgba32(70, 140, 235, 255)
         self.intro_rival_text.enabled = True
-        self.intro_refs_text.enabled = True
+        self.intro_runs_text.enabled = True
         self.intro_rival_text.animate_x(-0.01, duration=INTRO_SLIDE_DURATION, curve=curve.out_expo)
-        self.intro_refs_text.animate_x(0.01, duration=INTRO_SLIDE_DURATION, curve=curve.out_expo)
+        self.intro_runs_text.animate_x(0.01, duration=INTRO_SLIDE_DURATION, curve=curve.out_expo)
 
         self.play_button.color = color.rgb32(70, 140, 235)
         self.play_button.enabled = True
@@ -662,12 +662,12 @@ class Game:
         t = min(1.0, self.intro_elapsed / INTRO_FADE_DURATION)
         alpha = int(255 * (1 - t))
         self.intro_rival_text.color = color.rgba32(230, 55, 55, alpha)
-        self.intro_refs_text.color = color.rgba32(70, 140, 235, alpha)
+        self.intro_runs_text.color = color.rgba32(70, 140, 235, alpha)
 
         if self.intro_elapsed >= INTRO_FADE_DURATION:
             self.intro_active = False
             self.intro_rival_text.enabled = False
-            self.intro_refs_text.enabled = False
+            self.intro_runs_text.enabled = False
             self.countdown_active = True
             self.countdown_remaining = COUNTDOWN_SECONDS
             self.countdown_text.text = str(math.ceil(COUNTDOWN_SECONDS))
