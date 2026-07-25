@@ -9,7 +9,8 @@ Two models, two different jobs, sampled at very different rates:
     position. Lane doesn't need per-frame precision -- a player walking
     between lanes is a slow motion compared to a hand gesture -- so
     running pose at full rate was wasted compute measured to cost real
-    fps for no benefit here.
+    fps for no benefit here. Shoulder width is also sampled here, as a
+    stable per-person distance reference (see MAX_LOCK_JUMP_FRAC).
 
   HAND (every frame -- this is the main interaction now)
     -- the entire top strip of the frame is one generic GRAB zone (no
@@ -22,13 +23,22 @@ Two models, two different jobs, sampled at very different rates:
     fires a placement event using the drop zone's type and whichever lane
     pose currently reads.
 
-Measured trade-off before building this (see conversation, not re-run
-here): running pose AND hand on every single frame cost real performance
-(~10fps, and only 20% of frames found a hand at all -- likely resource
-contention between the two models rather than a hand-visibility problem,
-since sampling pose fixed both numbers at once). Hand-every-frame +
-pose-sampled measured ~27fps with an 88% hand-detection rate -- close to
-running just one model.
+Both hands work independently and simultaneously (see _HandSlot): each
+has its own lock, debounce, carry state, and cooldown timer, so you can
+alternate hands to place obstacles back-to-back without waiting on a
+single shared cooldown. Every frame, up to two detected hands are matched
+to the two slots by proximity to each slot's last known position (see
+_assign_candidates_to_slots) -- this is what lets each slot keep tracking
+the SAME physical hand across frames instead of the two hands potentially
+swapping which slot represents which.
+
+Measured trade-off before building the hand-tracking approach (see
+conversation, not re-run here): running pose AND hand on every single
+frame cost real performance (~10fps, and only 20% of frames found a hand
+at all -- likely resource contention between the two models rather than
+a hand-visibility problem, since sampling pose fixed both numbers at
+once). Hand-every-frame + pose-sampled measured ~27fps with an 88%
+hand-detection rate -- close to running just one model.
 
 Fist detection is a landmark-geometry heuristic (no separate classifier
 needed): for each of the four non-thumb fingers, curl is the bend ANGLE
@@ -88,7 +98,7 @@ FIST_MIN_CURLED_FINGERS = 3  # of 4, majority vote
 # 140) to require a tighter fist, up (e.g. 165) to accept a looser one.
 FIST_CURL_ANGLE_MAX_DEG = 150.0
 
-POSE_SAMPLE_EVERY_N_FRAMES = 5  # lane only needs occasional updates, not every frame
+POSE_SAMPLE_EVERY_N_FRAMES = 8  # lane only needs occasional updates, not every frame
 
 # Hand-lock tuning. A locked candidate is only accepted if its palm sits
 # within MAX_LOCK_JUMP_FRAC shoulder-widths of the last known position --
@@ -101,17 +111,20 @@ POSE_SAMPLE_EVERY_N_FRAMES = 5  # lane only needs occasional updates, not every 
 # player is standing from the camera -- a fixed raw-coordinate threshold
 # would be too tight up close and too loose far away, the same distance-
 # invariance problem that bit the old punch thresholds.
-MAX_LOCK_JUMP_FRAC = 1.0
+MAX_LOCK_JUMP_FRAC = 1.6  # raised from 1.0 -- a genuinely fast reach/swipe between two 33ms
+                          # frames could plausibly exceed one shoulder-width, and being
+                          # rejected as "a different hand" mid-gesture is worse than
+                          # occasionally being too lenient about what counts as the same hand
 DEFAULT_SHOULDER_WIDTH = 0.15  # fallback before pose has sampled even once
 
-# If the tracked hand goes fully undetected for this long, drop whatever
-# was being carried rather than risk a "phantom drop" firing wherever the
-# hand happens to reappear (e.g. back at the player's side, not a real
-# gesture) once tracking resumes.
+# If a tracked hand goes fully undetected for this long, drop whatever it
+# was carrying rather than risk a "phantom drop" firing wherever the hand
+# happens to reappear (e.g. back at the player's side, not a real gesture)
+# once tracking resumes.
 HAND_LOST_CANCEL_CARRY_SEC = 0.6
-# If undetected for even longer than that, give up the lock entirely --
-# the next detection is treated as a fresh first-ever acquisition rather
-# than something that must match a stale remembered position.
+# If undetected for even longer than that, give up that slot's lock
+# entirely -- the next detection is treated as a fresh first-ever
+# acquisition rather than something that must match a stale position.
 HAND_LOST_FORGET_LOCK_SEC = 1.0
 
 # The fist-closed reading is a coarse per-frame heuristic and can flicker
@@ -134,13 +147,24 @@ CLOSE_DEBOUNCE_FRAMES = 2
 # (see debug_overlay) rather than guessed again blind.
 HAND_MIN_CONFIDENCE = 0.2
 
-# Exponential smoothing on the tracked palm position (0 < alpha <= 1;
+# Exponential smoothing on each tracked palm position (0 < alpha <= 1;
 # higher = less smoothing, more responsive). Raw per-frame landmark
 # position has real pixel-level jitter even when the hand isn't actually
 # moving, which was making zone-boundary checks (grab/drop) flicker right
 # at the edges. This is applied to the position used for BOTH the
 # on-screen marker and the zone/lock math, not just cosmetically.
-PALM_SMOOTHING_ALPHA = 0.5
+#
+# Alpha is VELOCITY-ADAPTIVE, not fixed: smoothing always trades
+# responsiveness for stability, and a fixed alpha tuned to kill jitter at
+# rest makes the tracked position lag behind a genuinely fast-moving hand,
+# which is exactly the opposite of what's needed during a fast gesture.
+# When the raw frame-to-frame movement is large, that's real motion, not
+# noise -- so alpha ramps up toward 1.0 (trust the raw position almost
+# completely) and only drops toward PALM_SMOOTHING_ALPHA_MIN when the hand
+# is nearly still, where jitter actually dominates the signal.
+PALM_SMOOTHING_ALPHA_MIN = 0.35   # used when the hand is roughly stationary
+PALM_SMOOTHING_ALPHA_MAX = 0.95   # used at or above FAST_MOVEMENT_THRESHOLD
+FAST_MOVEMENT_THRESHOLD = 0.06    # normalized-distance frame-to-frame jump considered "fast"
 
 LANE_NAMES = ("left", "center", "right")
 OBSTACLE_HIGH = "high"
@@ -172,15 +196,56 @@ DROP_ZONE_COLORS = {
 # session -- a local count, not the live game score, so it needs no
 # networking beyond what already exists. Decays linearly from MAX down to
 # MIN, floored so B can never spam faster than MIN regardless of count.
+# This cooldown is GLOBAL (shared placement_count across both hands, so it
+# reflects overall session pacing), but each hand slot tracks its OWN
+# last-placement-time against it -- that's what lets both hands be
+# independently ready/cooling at different moments, doubling throughput
+# versus a single shared timer.
 PLACEMENT_COOLDOWN_MAX_SEC = 0.9
 PLACEMENT_COOLDOWN_MIN_SEC = 0.5
 PLACEMENT_COOLDOWN_DECAY_PER_PLACEMENT = 0.006
 
+# Visual style constants for the (now two-handed) debug overlay.
+HAND_SLOT_COLORS = ((255, 210, 60), (255, 120, 220))  # per-slot marker tint (BGR), slot 0 / slot 1
+PANEL_BG_ALPHA = 0.55       # opacity of the dark status panel behind text
+PANEL_COLOR = (18, 18, 18)
+
+
+class _HandSlot:
+    """Independent per-hand tracking state -- lock, debounce, carry, and a
+    per-hand cooldown timer. Two of these let both hands grab/drop
+    independently without one hand's gesture interfering with the
+    other's, and without either accidentally locking onto the other's
+    position."""
+
+    def __init__(self, label):
+        self.label = label  # purely for the overlay ("1" / "2")
+
+        self.locked_palm_xy = None    # last known SMOOTHED position of this slot's hand
+        self.smoothed_palm_xy = None  # EMA state, reset to None whenever this hand is lost
+        self.hand_lost_since = None   # timestamp this hand FIRST went undetected, or None if currently seen
+        self.fist_open_streak = 0     # consecutive frames read "open" while carrying, for debounce
+        self.fist_closed_streak = 0   # consecutive frames read "closed" while not carrying, for debounce
+        self.last_placement_time = 0.0
+
+        # Live per-frame state, read by the overlay.
+        self.hand_visible = False
+        self.hand_confidence = None  # best handedness score matched to this slot this frame
+        self.fist_closed = False
+        self.hand_xy = None
+        self.is_carrying = False
+
+        # Brief visual "pop" at this slot's place location, purely cosmetic.
+        self.place_flash_xy = None
+        self.place_flash_time = 0.0
+        self.place_flash_color = (0, 255, 255)
+
 
 class PlayerBTracker:
-    """Feed frames in with process_frame(); poll .lane / .is_carrying /
-    .fist_closed for live state each frame, and check the returned event
-    for a placement."""
+    """Feed frames in with process_frame(); poll .lane / ._slots (two
+    _HandSlot instances) for live state each frame, and check the
+    returned "events" list for placements -- both hands can each fire one
+    on the same frame."""
 
     def __init__(self):
         for p in (POSE_MODEL_PATH, HAND_MODEL_PATH):
@@ -196,11 +261,6 @@ class PlayerBTracker:
                 num_poses=1,
             )
         )
-        # num_hands=2 even though we only ever act on ONE -- if a second
-        # hand (or anyone else's) enters frame, we need candidates to
-        # choose from so we can lock onto whichever one is actually being
-        # tracked, rather than only ever seeing whatever the model ranks
-        # highest that frame (which can silently swap hands frame to frame).
         self._hand_landmarker = mp_vision.HandLandmarker.create_from_options(
             mp_vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH)),
@@ -208,31 +268,18 @@ class PlayerBTracker:
                 num_hands=2,
             )
         )
-        self._locked_palm_xy = None  # last known SMOOTHED position of the hand we're tracking
-        self._hand_lost_since = None  # timestamp the hand FIRST went undetected, or None if currently seen
-        self._fist_open_streak = 0    # consecutive frames read "open" while carrying, for debounce
-        self._fist_closed_streak = 0  # consecutive frames read "closed" while not carrying, for debounce
         self._shoulder_width = DEFAULT_SHOULDER_WIDTH  # updated whenever pose is sampled
-        self._smoothed_palm_xy = None  # EMA state, reset to None whenever the hand is lost
         self._start_time = time.time()
         self._frame_count = 0
+
+        self._slots = [_HandSlot("1"), _HandSlot("2")]
 
         # Live state.
         self.lane = 1              # default to center lane until first detection
         self.pose_visible = False
-        self.hand_visible = False
-        self.hand_confidence = None  # best handedness score seen this frame, even if it didn't qualify
-        self.fist_closed = False
-        self.hand_xy = None        # (x, y) normalized, palm-center position of the tracked hand
-        self.is_carrying = False   # holding a (still generic, type undecided) grabbed object
 
-        self.placement_count = 0
-        self._last_placement_time = 0.0
-
-        # Brief visual "pop" at the place location, purely cosmetic.
-        self._place_flash_xy = None
-        self._place_flash_time = 0.0
-        self._place_flash_color = (0, 255, 255)
+        self.placement_count = 0   # global, shared across both hands -- see cooldown comment above
+        self._manual_last_placement_time = 0.0  # separate cooldown gate for the keyboard fallback
 
     def close(self):
         self._pose_landmarker.close()
@@ -257,9 +304,9 @@ class PlayerBTracker:
         the fallback path spam instantly with no pacing at all. Returns
         the event dict if it fired, or None if still on cooldown."""
         now = time.time()
-        if (now - self._last_placement_time) < self.current_cooldown_sec:
+        if (now - self._manual_last_placement_time) < self.current_cooldown_sec:
             return None
-        self._last_placement_time = now
+        self._manual_last_placement_time = now
         self.placement_count += 1
         return {"lane": lane, "obstacle_type": obstacle_type}
 
@@ -269,12 +316,11 @@ class PlayerBTracker:
         Returns a dict describing this frame's result:
             {
               "pose_visible": bool,
-              "hand_visible": bool,
               "lane": 0|1|2,
-              "is_carrying": bool,
-              "event": {"lane": int, "obstacle_type": str} or None,
+              "events": [{"lane": int, "obstacle_type": str}, ...],
             }
-        `event` is only non-None on the exact frame a placement fires.
+        `events` is a list because both hands can each fire a placement on
+        the same frame -- usually empty, occasionally one entry, rarely two.
         """
         now = time.time()
         timestamp_ms = int((now - self._start_time) * 1000)
@@ -295,112 +341,140 @@ class PlayerBTracker:
 
         hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
         scored = _pair_with_confidence(hand_result.hand_landmarks, hand_result.handedness)
-        # Tracked regardless of whether anything qualifies below, so the
-        # debug overlay can show "a hand WAS seen, just below threshold"
-        # instead of an undifferentiated "no hand" -- this is exactly the
-        # number that should drive HAND_MIN_CONFIDENCE, not a guess.
-        self.hand_confidence = max((s for _, s in scored), default=None)
+        # Kept as (landmarks, score) pairs, not filtered yet -- the debug
+        # overlay wants to show a slot's best-seen confidence even on
+        # frames where nothing qualified, so tuning HAND_MIN_CONFIDENCE
+        # can be read off real numbers instead of guessed at again.
         candidates = [lm for lm, s in scored if s >= HAND_MIN_CONFIDENCE]
+        confidences = [s for lm, s in scored if s >= HAND_MIN_CONFIDENCE]
 
-        selected = None
-        if candidates:
-            # None means the model found a confident hand (or two), but
-            # neither is close enough to our last known position to
-            # plausibly be the SAME hand -- treated the same as no
-            # detection at all, rather than blindly adopting whatever
-            # showed up.
-            selected = self._select_locked_hand(candidates)
+        assignment = self._assign_candidates_to_slots(candidates)
 
-        event = None
-        if selected is not None:
-            self.hand_visible = True
-            self._hand_lost_since = None
-            raw_xy = _palm_center(selected)
-            if self._smoothed_palm_xy is None:
-                self._smoothed_palm_xy = raw_xy
-            else:
-                sx, sy = self._smoothed_palm_xy
-                rx, ry = raw_xy
-                self._smoothed_palm_xy = (
-                    PALM_SMOOTHING_ALPHA * rx + (1 - PALM_SMOOTHING_ALPHA) * sx,
-                    PALM_SMOOTHING_ALPHA * ry + (1 - PALM_SMOOTHING_ALPHA) * sy,
+        events = []
+        for slot, candidate_idx in zip(self._slots, assignment):
+            if candidate_idx is not None:
+                event = self._update_slot_from_candidate(
+                    slot, candidates[candidate_idx], confidences[candidate_idx], now
                 )
-            self.hand_xy = self._smoothed_palm_xy
-            self._locked_palm_xy = self.hand_xy
-            self.fist_closed = _is_fist(selected)
-            event = self._update_grab_place_state(now)
-        else:
-            self._smoothed_palm_xy = None  # don't let stale smoothing bleed into the next acquisition
-            self._handle_hand_not_visible(now)
+            else:
+                self._handle_slot_not_visible(slot, now)
+                event = None
+            if event is not None:
+                events.append(event)
 
         return {
             "pose_visible": self.pose_visible,
-            "hand_visible": self.hand_visible,
             "lane": self.lane,
-            "is_carrying": self.is_carrying,
-            "event": event,
+            "events": events,
         }
 
-    def _select_locked_hand(self, all_hand_landmarks):
-        """Given 1-2 detected hands this frame, picks whichever one we're
-        actually tracking, or None if nothing qualifies.
+    def _assign_candidates_to_slots(self, candidates):
+        """Matches up to len(candidates) detected hands to self._slots, so
+        each slot keeps tracking the same physical hand frame to frame
+        instead of the two hands potentially swapping which slot
+        represents which. Returns a list, one entry per slot, of the
+        assigned candidate's index into `candidates`, or None if nothing
+        was matched to that slot this frame.
 
-        With no prior lock (first-ever detection, or the lock has been
-        given up after a long enough gap -- see HAND_LOST_FORGET_LOCK_SEC),
-        the first candidate is trusted outright; there's nothing to compare
-        it against yet.
+        Locked slots get first claim on their nearest candidate (within
+        MAX_LOCK_JUMP_FRAC shoulder-widths), matched smallest-distance-
+        first so the better-fitting pair wins when two locked slots'
+        nearest candidates would otherwise collide on the same one --
+        correct for the 1-2 candidates / 1-2 slots case this always
+        operates in, without needing a general assignment-problem solver.
+        Any slot without a lock yet (first-ever acquisition) claims
+        whatever candidate is left over, in slot order."""
+        n_slots = len(self._slots)
+        assigned = [None] * n_slots
+        if not candidates:
+            return assigned
 
-        With a prior lock, this does NOT just trust whichever candidate is
-        closest -- distance alone doesn't distinguish "this is the same
-        hand, slightly moved" from "this is a completely different hand
-        that happens to be nearest of the options available". A candidate
-        is only accepted if it's within MAX_LOCK_JUMP_FRAC shoulder-widths
-        of the last known position -- scaled by the player's own shoulder
-        width (from pose) rather than a fixed raw-coordinate distance, so
-        the same real hand speed reads the same whether the player is
-        standing close to or far from the camera. A single detected hand
-        still has to clear this bar, not just multiple candidates (a
-        normal single-player frame usually has exactly one hand detected,
-        so gating only the multi-candidate case would leave the common
-        failure mode -- the tracked hand leaving frame and a different
-        hand becoming the sole detection -- completely unguarded)."""
-        if self._locked_palm_xy is None:
-            return all_hand_landmarks[0]
+        centers = [_palm_center(c) for c in candidates]
+        max_dist_sq = (MAX_LOCK_JUMP_FRAC * self._shoulder_width) ** 2
 
-        lx, ly = self._locked_palm_xy
-        max_dist = MAX_LOCK_JUMP_FRAC * self._shoulder_width
+        locked_slot_idxs = [i for i, s in enumerate(self._slots) if s.locked_palm_xy is not None]
+        unlocked_slot_idxs = [i for i, s in enumerate(self._slots) if s.locked_palm_xy is None]
 
-        def _dist_sq(lm):
-            px, py = _palm_center(lm)
-            return (px - lx) ** 2 + (py - ly) ** 2
+        pairs = []
+        for si in locked_slot_idxs:
+            lx, ly = self._slots[si].locked_palm_xy
+            for ci, (cx, cy) in enumerate(centers):
+                d2 = (cx - lx) ** 2 + (cy - ly) ** 2
+                pairs.append((d2, si, ci))
+        pairs.sort(key=lambda p: p[0])
 
-        best = min(all_hand_landmarks, key=_dist_sq)
-        if _dist_sq(best) > max_dist ** 2:
-            return None
-        return best
+        taken_slots, taken_candidates = set(), set()
+        for d2, si, ci in pairs:
+            if si in taken_slots or ci in taken_candidates or d2 > max_dist_sq:
+                continue
+            assigned[si] = ci
+            taken_slots.add(si)
+            taken_candidates.add(ci)
 
-    def _handle_hand_not_visible(self, now):
-        """Called when no hand landmarks were detected this frame, OR a
-        hand was detected but didn't pass the lock's distance gate (see
-        _select_locked_hand) -- both cases mean "we don't currently have a
-        trustworthy read on our tracked hand", handled identically."""
-        self.hand_visible = False
-        self.hand_xy = None
-        self.fist_closed = False
-        self._fist_open_streak = 0
+        leftover = [ci for ci in range(len(candidates)) if ci not in taken_candidates]
+        for si in unlocked_slot_idxs:
+            if si in taken_slots:
+                continue
+            if leftover:
+                ci = leftover.pop(0)
+                assigned[si] = ci
+                taken_candidates.add(ci)
 
-        if self._hand_lost_since is None:
-            self._hand_lost_since = now
-        lost_duration = now - self._hand_lost_since
+        return assigned
 
-        if self.is_carrying and lost_duration >= HAND_LOST_CANCEL_CARRY_SEC:
+    def _update_slot_from_candidate(self, slot, lm, confidence, now):
+        slot.hand_visible = True
+        slot.hand_confidence = confidence
+        slot.hand_lost_since = None
+
+        raw_xy = _palm_center(lm)
+        if slot.smoothed_palm_xy is None:
+            slot.smoothed_palm_xy = raw_xy
+        else:
+            sx, sy = slot.smoothed_palm_xy
+            rx, ry = raw_xy
+            jump = ((rx - sx) ** 2 + (ry - sy) ** 2) ** 0.5
+            # Ramp alpha up toward MAX as the jump approaches/exceeds
+            # FAST_MOVEMENT_THRESHOLD -- a big frame-to-frame move is real
+            # motion, not jitter, so trust the raw position almost
+            # completely rather than lagging behind it.
+            blend = min(1.0, jump / FAST_MOVEMENT_THRESHOLD)
+            alpha = PALM_SMOOTHING_ALPHA_MIN + blend * (PALM_SMOOTHING_ALPHA_MAX - PALM_SMOOTHING_ALPHA_MIN)
+            slot.smoothed_palm_xy = (
+                alpha * rx + (1 - alpha) * sx,
+                alpha * ry + (1 - alpha) * sy,
+            )
+        slot.hand_xy = slot.smoothed_palm_xy
+        slot.locked_palm_xy = slot.hand_xy
+        slot.fist_closed = _is_fist(lm)
+        return self._update_grab_place_state(slot, now)
+
+    def _handle_slot_not_visible(self, slot, now):
+        """Called when no candidate was matched to this slot this frame --
+        either nothing was detected at all, or a hand was detected but
+        didn't pass the lock's distance gate (see
+        _assign_candidates_to_slots) -- both cases mean "we don't
+        currently have a trustworthy read on this slot's hand", handled
+        identically."""
+        slot.hand_visible = False
+        slot.hand_xy = None
+        slot.hand_confidence = None
+        slot.fist_closed = False
+        slot.fist_open_streak = 0
+        slot.smoothed_palm_xy = None
+
+        if slot.hand_lost_since is None:
+            slot.hand_lost_since = now
+        lost_duration = now - slot.hand_lost_since
+
+        if slot.is_carrying and lost_duration >= HAND_LOST_CANCEL_CARRY_SEC:
             # Don't leave a carry to be silently "placed" wherever the hand
             # happens to reappear once tracking resumes -- that's a
             # tracking hiccup, not a real drop gesture.
-            self.is_carrying = False
+            slot.is_carrying = False
 
         if lost_duration >= HAND_LOST_FORGET_LOCK_SEC:
-            self._locked_palm_xy = None
+            slot.locked_palm_xy = None
 
     def _update_lane(self, lm):
         hip_x = (lm[LEFT_HIP].x + lm[RIGHT_HIP].x) / 2
@@ -434,7 +508,7 @@ class PlayerBTracker:
         third = max(0, min(2, third))
         return DROP_TYPES_LEFT_TO_RIGHT[third]
 
-    def _update_grab_place_state(self, now):
+    def _update_grab_place_state(self, slot, now):
         """Level-triggered, not edge-triggered: the fist just needs to BE
         closed while in the grab zone -- it doesn't matter whether it
         closed before or after entering the zone, both grab. is_carrying
@@ -449,51 +523,55 @@ class PlayerBTracker:
         a single frame in either direction, so both a false "open"
         mid-carry (would silently cancel the whole carry) and a false
         "closed" while merely passing a hand through the strip (would
-        grab when nothing was intended) get the same treatment."""
-        x, y = self.hand_xy
+        grab when nothing was intended) get the same treatment.
+
+        Operates on one slot at a time -- lane and the global cooldown
+        curve are shared, but is_carrying/streaks/last_placement_time are
+        all per-slot, so this hand's gesture never affects the other's."""
+        x, y = slot.hand_xy
         event = None
 
-        if not self.is_carrying:
-            self._fist_open_streak = 0  # not relevant yet -- don't let a stale streak leak into the next carry
+        if not slot.is_carrying:
+            slot.fist_open_streak = 0  # not relevant yet -- don't let a stale streak leak into the next carry
 
-            if self.fist_closed:
-                self._fist_closed_streak += 1
+            if slot.fist_closed:
+                slot.fist_closed_streak += 1
             else:
-                self._fist_closed_streak = 0
+                slot.fist_closed_streak = 0
 
-            if self._fist_closed_streak >= CLOSE_DEBOUNCE_FRAMES and self._in_grab_zone(y):
-                self.is_carrying = True
-                self._fist_closed_streak = 0
+            if slot.fist_closed_streak >= CLOSE_DEBOUNCE_FRAMES and self._in_grab_zone(y):
+                slot.is_carrying = True
+                slot.fist_closed_streak = 0
         else:
-            self._fist_closed_streak = 0  # symmetric reset, mirrors the open-streak reset above
-            if self.fist_closed:
-                self._fist_open_streak = 0
+            slot.fist_closed_streak = 0  # symmetric reset, mirrors the open-streak reset above
+            if slot.fist_closed:
+                slot.fist_open_streak = 0
             else:
-                self._fist_open_streak += 1
+                slot.fist_open_streak += 1
 
-            if self._fist_open_streak >= OPEN_DEBOUNCE_FRAMES:
+            if slot.fist_open_streak >= OPEN_DEBOUNCE_FRAMES:
                 drop_type = self._drop_zone_at(x, y)
-                past_cooldown = (now - self._last_placement_time) >= self.current_cooldown_sec
+                past_cooldown = (now - slot.last_placement_time) >= self.current_cooldown_sec
                 if drop_type is not None and past_cooldown:
                     event = {"lane": self.lane, "obstacle_type": drop_type}
-                    self._last_placement_time = now
+                    slot.last_placement_time = now
                     self.placement_count += 1
-                    self._place_flash_xy = (x, y)
-                    self._place_flash_time = now
-                    self._place_flash_color = DROP_ZONE_COLORS[drop_type]
+                    slot.place_flash_xy = (x, y)
+                    slot.place_flash_time = now
+                    slot.place_flash_color = DROP_ZONE_COLORS[drop_type]
                 # Whether it landed in a valid drop zone, was still on
                 # cooldown, or opened too early back in the grab strip --
                 # the hand is empty again either way. Don't leave it
                 # "stuck" carrying; the player can just grab again.
-                self.is_carrying = False
-                self._fist_open_streak = 0
+                slot.is_carrying = False
+                slot.fist_open_streak = 0
 
         return event
 
     def debug_overlay(self, frame):
-        """Draws the grab strip, the three drop zones, hand/fist state,
-        and a placement flash onto a BGR frame in place. Lane (from body
-        position, not hand position) is shown as text only -- it's a
+        """Draws the grab strip, the three drop zones, both hands' state,
+        and any placement flashes onto a BGR frame in place. Lane (from
+        body position, not hand position) is shown as text only -- it's a
         different left/center/right axis than the drop zones and drawing
         both as vertical dividers in the same space would be genuinely
         confusing to look at. For the manual test window."""
@@ -501,60 +579,98 @@ class PlayerBTracker:
 
         h, w = frame.shape[:2]
         grab_h = int(h * GRAB_ZONE_HEIGHT_FRAC)
+        any_carrying = any(s.is_carrying for s in self._slots)
 
         # Grab strip: one zone, full width, no type.
-        grab_color = (200, 200, 0) if self.is_carrying else (120, 120, 120)
-        cv2.rectangle(frame, (4, 4), (w - 4, grab_h - 4), grab_color, 3)
-        cv2.putText(frame, "GRAB HERE", (w // 2 - 70, grab_h - 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, grab_color, 2)
+        grab_color = (210, 210, 40) if any_carrying else (130, 130, 130)
+        cv2.rectangle(frame, (4, 4), (w - 4, grab_h - 4), grab_color, 3, cv2.LINE_AA)
+        _draw_text(frame, "GRAB HERE", (w // 2 - 78, grab_h - 14), 0.75, grab_color, thickness=2)
 
         # Drop zones: large, cover the rest of the frame.
         for i, obstacle_type in enumerate(DROP_TYPES_LEFT_TO_RIGHT):
             x0, x1 = int(w * i / 3), int(w * (i + 1) / 3)
             color = DROP_ZONE_COLORS[obstacle_type]
-            cv2.rectangle(frame, (x0 + 4, grab_h + 4), (x1 - 4, h - 4), color, 3)
-            cv2.putText(frame, obstacle_type.upper(), (x0 + 20, grab_h + 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.rectangle(frame, (x0 + 4, grab_h + 4), (x1 - 4, h - 4), color, 3, cv2.LINE_AA)
+            _draw_text(frame, obstacle_type.upper(), (x0 + 20, grab_h + 42), 0.85, color, thickness=2)
             if i > 0:
-                cv2.line(frame, (x0, grab_h), (x0, h), (80, 80, 80), 1)
+                cv2.line(frame, (x0, grab_h), (x0, h), (90, 90, 90), 1, cv2.LINE_AA)
 
-        lane_color = (0, 255, 0) if self.pose_visible else (0, 0, 255)
-        cv2.putText(frame, f"lane (body position): {LANE_NAMES[self.lane]}", (10, h - 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, lane_color, 2)
+        # Status panel: one semi-transparent dark strip behind all the text
+        # rows, instead of raw text floating on top of whatever the camera
+        # sees -- legibility over any background, and it reads as a single
+        # deliberate UI element rather than debug prints scattered on video.
+        panel_top = h - 190
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, panel_top), (w, h), PANEL_COLOR, -1)
+        cv2.addWeighted(overlay, PANEL_BG_ALPHA, frame, 1 - PANEL_BG_ALPHA, 0, dst=frame)
 
-        carried_text = "YES (find a drop zone)" if self.is_carrying else "no (grab in the top strip)"
-        cv2.putText(frame, f"carrying: {carried_text}", (10, h - 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+        lane_color = (120, 255, 120) if self.pose_visible else (120, 120, 255)
+        _draw_text(frame, f"LANE  {LANE_NAMES[self.lane].upper()}", (14, h - 158), 0.7, lane_color, thickness=2)
 
         cooldown = self.current_cooldown_sec
-        cooldown_remaining = max(0.0, cooldown - (time.time() - self._last_placement_time))
-        ready = cooldown_remaining <= 0
-        state_color = (0, 255, 0) if ready else (0, 165, 255)
-        state_text = "ready" if ready else f"cooldown {cooldown_remaining:.1f}s"
-        cv2.putText(frame, f"placement: {state_text}  [#{self.placement_count}, cd={cooldown:.2f}s]",
-                    (10, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
+        _draw_text(
+            frame,
+            f"placements: {self.placement_count}   cooldown: {cooldown:.2f}s",
+            (14, h - 128), 0.55, (210, 210, 210), thickness=1,
+        )
 
-        hand_color = (0, 0, 255) if not self.hand_visible else ((0, 165, 255) if self.fist_closed else (0, 255, 0))
-        hand_state = "no hand" if not self.hand_visible else ("FIST" if self.fist_closed else "open")
-        conf_text = f"{self.hand_confidence:.2f}" if self.hand_confidence is not None else "--"
-        cv2.putText(frame, f"hand: {hand_state}  (confidence: {conf_text}, need >= {HAND_MIN_CONFIDENCE})",
-                    (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.55, hand_color, 2)
+        for row, slot in enumerate(self._slots):
+            self._draw_slot_status(frame, slot, row, h)
 
-        if self.hand_xy is not None:
-            hx, hy = self.hand_xy
-            marker_color = (0, 165, 255) if self.fist_closed else (0, 255, 0)
-            cv2.circle(frame, (int(hx * w), int(hy * h)), 14, marker_color, 3 if self.fist_closed else 2)
+        # Hand markers + placement flashes.
+        for slot in self._slots:
+            color = HAND_SLOT_COLORS[int(slot.label) - 1]
+            if slot.hand_xy is not None:
+                hx, hy = slot.hand_xy
+                px, py = int(hx * w), int(hy * h)
+                ring_color = (0, 210, 255) if slot.is_carrying else (color if slot.fist_closed else (120, 255, 120))
+                cv2.circle(frame, (px, py), 16, ring_color, 3 if slot.fist_closed else 2, cv2.LINE_AA)
+                cv2.circle(frame, (px, py), 3, ring_color, -1, cv2.LINE_AA)
+                _draw_text(frame, slot.label, (px + 18, py + 6), 0.55, color, thickness=2)
 
-        # Brief flash where a placement just fired, colored to match the
-        # drop zone's type -- confirms visually which type actually fired,
-        # not just that something did.
-        flash_age = time.time() - self._place_flash_time
-        if self._place_flash_xy is not None and flash_age < 0.3:
-            fx, fy = self._place_flash_xy
-            radius = int(20 + flash_age * 120)
-            cv2.circle(frame, (int(fx * w), int(fy * h)), radius, self._place_flash_color, 2)
+            flash_age = time.time() - slot.place_flash_time
+            if slot.place_flash_xy is not None and flash_age < 0.3:
+                fx, fy = slot.place_flash_xy
+                radius = int(20 + flash_age * 120)
+                thickness = max(1, int(3 * (1 - flash_age / 0.3)))
+                cv2.circle(frame, (int(fx * w), int(fy * h)), radius, slot.place_flash_color, thickness, cv2.LINE_AA)
 
         return frame
+
+    def _draw_slot_status(self, frame, slot, row, h):
+        import cv2
+
+        color = HAND_SLOT_COLORS[int(slot.label) - 1]
+        y = h - 96 + row * 44
+
+        if not slot.hand_visible:
+            state_text, state_color = "no hand", (120, 120, 255)
+        elif slot.is_carrying:
+            state_text, state_color = "carrying -- find a drop zone", (0, 215, 255)
+        elif slot.fist_closed:
+            state_text, state_color = "fist (grab in the top strip)", (120, 190, 255)
+        else:
+            state_text, state_color = "open", (120, 255, 120)
+
+        cooldown_remaining = max(0.0, self.current_cooldown_sec - (time.time() - slot.last_placement_time))
+        ready_text = "ready" if cooldown_remaining <= 0 else f"cooldown {cooldown_remaining:.1f}s"
+        conf_text = f"{slot.hand_confidence:.2f}" if slot.hand_confidence is not None else "--"
+
+        _draw_text(frame, f"HAND {slot.label}", (14, y), 0.6, color, thickness=2)
+        _draw_text(
+            frame, f"{state_text}  |  {ready_text}  |  conf {conf_text}",
+            (108, y), 0.52, state_color, thickness=1,
+        )
+
+
+def _draw_text(frame, text, pos, scale, color, thickness=1):
+    """cv2.putText with a black outline underneath -- keeps text legible
+    over live, unpredictable camera video (a bright window, skin tone,
+    clothing) that a flat color alone won't reliably contrast against."""
+    import cv2
+
+    cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
 def _dist(a, b):
