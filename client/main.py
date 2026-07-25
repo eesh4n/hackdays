@@ -1,15 +1,17 @@
 """
 Player B entrypoint -- runs on Laptop 2 ("the obstacle placer").
 
-Opens the webcam, runs the lane + obstacle-height tracker, and sends a
-placement event over WebSocket to the game host every time Player B
-punches -- a short beep and a fading trail of the punching wrist confirm
-each placement locally, independent of whether the network delivery
-actually succeeds. Also draws a debug preview window (lane dividers,
-current lane/obstacle state, punch-armed indicator, last-successful-send
-age) so you can see what's being tracked live -- worth leaving on even
-during the real demo, just moved off to the side, since it's the fastest
-way to tell if tracking is misbehaving before a judge notices.
+Opens the webcam, runs the lane + grab/place tracker, and sends a
+placement event over WebSocket to the game host every time Player B grabs
+a generic object from the top GRAB strip (fist closes) and releases it
+(fist opens) inside one of the three large LOW/MEDIUM/HIGH drop zones
+below -- the drop zone decides the type, not the grab location. A short
+beep confirms each placement locally, independent of whether the network
+delivery actually succeeds. Also draws a debug preview window (grab
+strip, drop zones, lane, hand/fist state, last-successful-send age) so
+you can see what's being tracked live -- worth leaving on even during the
+real demo, just moved off to the side, since it's the fastest way to tell
+if tracking is misbehaving before a judge notices.
 
 Usage:
     python main.py <server_ip> [--port 8765] [--camera 0]
@@ -18,11 +20,12 @@ Keyboard fallback (per hackathon-prep/PLAN.md resilience guidance -- keep
 manual input alive as a permanent fallback in case the camera or pose
 tracking dies mid-demo, not just for hour-0 testing):
     1 / 2 / 3   -- force current lane to left / center / right
-    h / m / l   -- force current obstacle type to high / medium / low
+    h / m / l   -- manually "grab" high / medium / low (fallback for the
+                   hand-gesture grab, e.g. if hand tracking is unreliable)
     SPACE       -- manually fire a placement with whatever lane/obstacle
-                   is currently selected (bypasses the punch gesture)
+                   is currently selected (bypasses the grab/place gesture)
     f           -- toggle fullscreen
-    r           -- reset punch count (cooldown scaling starts over --
+    r           -- reset placement count (cooldown scaling starts over --
                    use this at the start of each new round, since B has
                    no way to know the host restarted automatically)
     q           -- quit
@@ -40,16 +43,16 @@ from websocket_client import WebSocketClient, DEFAULT_PORT
 
 WINDOW_NAME = "Player B (obstacle placer)"
 
-PUNCH_BEEP_FREQ_HZ = 880
-PUNCH_BEEP_DURATION_MS = 80
+PLACE_BEEP_FREQ_HZ = 880
+PLACE_BEEP_DURATION_MS = 80
 
 
-def _play_punch_beep():
+def _play_place_beep():
     """winsound.Beep blocks the calling thread for its whole duration, so
     it runs on a short-lived daemon thread -- the camera loop must never
     stall waiting on a beep, even a short one, at 30fps."""
     threading.Thread(
-        target=winsound.Beep, args=(PUNCH_BEEP_FREQ_HZ, PUNCH_BEEP_DURATION_MS), daemon=True
+        target=winsound.Beep, args=(PLACE_BEEP_FREQ_HZ, PLACE_BEEP_DURATION_MS), daemon=True
     ).start()
 
 
@@ -75,15 +78,15 @@ def main():
     client.start()
 
     print(f"[main] connecting out to {args.server_ip}:{args.port} ...")
-    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = obstacle type, SPACE = force-place, "
-          "f = fullscreen, r = reset punch count, q = quit")
+    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = manual grab, SPACE = force-place, "
+          "f = fullscreen, r = reset placement count, q = quit")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     fullscreen = True
 
     # Manual override state for the keyboard fallback path. None means
-    # "use whatever the camera tracker is currently reading".
+    # "use whatever the camera tracker is currently reading/carrying".
     manual_lane = None
     manual_obstacle = None
 
@@ -99,16 +102,22 @@ def main():
             result = tracker.process_frame(rgb)
 
             effective_lane = manual_lane if manual_lane is not None else result["lane"]
-            effective_obstacle = manual_obstacle if manual_obstacle is not None else result["obstacle_type"]
+            # No gesture-path fallback here anymore -- the drop zone decides
+            # the type at the instant of release, there's no "currently
+            # selected type" to read mid-gesture the way there used to be.
+            # This only matters for the SPACE key below (manual_obstacle
+            # must be set via h/m/l first).
+            effective_obstacle = manual_obstacle
 
             if result["event"] is not None:
                 client.send({
                     "player": "B",
-                    "lane": effective_lane,
-                    "obstacle": effective_obstacle,
+                    "lane": result["event"]["lane"],
+                    "obstacle": result["event"]["obstacle_type"],
                 })
-                _play_punch_beep()
-                print(f"[main] >> placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
+                _play_place_beep()
+                print(f"[main] >> placed {result['event']['obstacle_type']} obstacle "
+                      f"in lane {LANE_NAMES[result['event']['lane']]}")
 
             tracker.debug_overlay(frame)
             conn_color = (0, 255, 0) if client.connected else (0, 0, 255)
@@ -156,15 +165,15 @@ def main():
             elif key == ord('l'):
                 manual_obstacle = OBSTACLE_LOW
             elif key == ord('r'):
-                tracker.reset_punch_count()
-                print("[main] punch count reset -- cooldown scaling starts over")
-            elif key == ord(' '):
+                tracker.reset_placement_count()
+                print("[main] placement count reset -- cooldown scaling starts over")
+            elif key == ord(' ') and effective_obstacle is not None:
                 client.send({
                     "player": "B",
                     "lane": effective_lane,
                     "obstacle": effective_obstacle,
                 })
-                _play_punch_beep()
+                _play_place_beep()
                 print(f"[main] >> (manual) placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
 
     finally:
