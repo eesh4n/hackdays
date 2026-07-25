@@ -20,6 +20,9 @@ tracking dies mid-demo, not just for hour-0 testing):
     SPACE       -- manually fire a placement with whatever lane/obstacle
                    is currently selected (bypasses the punch gesture)
     f           -- toggle fullscreen
+    r           -- reset punch count (cooldown scaling starts over --
+                   use this at the start of each new round, since B has
+                   no way to know the host restarted automatically)
     q           -- quit
 """
 import argparse
@@ -55,7 +58,8 @@ def main():
     client.start()
 
     print(f"[main] connecting out to {args.server_ip}:{args.port} ...")
-    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = obstacle type, SPACE = force-place, f = fullscreen, q = quit")
+    print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = obstacle type, SPACE = force-place, "
+          "f = fullscreen, r = reset punch count, q = quit")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -120,6 +124,9 @@ def main():
                 manual_obstacle = OBSTACLE_MEDIUM
             elif key == ord('l'):
                 manual_obstacle = OBSTACLE_LOW
+            elif key == ord('r'):
+                tracker.reset_punch_count()
+                print("[main] punch count reset -- cooldown scaling starts over")
             elif key == ord(' '):
                 client.send({
                     "player": "B",

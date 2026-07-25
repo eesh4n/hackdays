@@ -91,7 +91,12 @@ class WebSocketClient:
                     self.connected = True
                     delay = RECONNECT_DELAY_SEC  # reset backoff after a successful connect
                     await self._pump_send_queue(ws)
-            except (OSError, websockets.exceptions.WebSocketException) as e:
+            except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
+                # open_timeout above raises asyncio.TimeoutError, which on
+                # Python <3.11 is NOT a subclass of the builtin TimeoutError
+                # or OSError -- it was slipping past this except entirely
+                # and killing the whole reconnect loop's thread permanently
+                # (no more retries) instead of backing off and trying again.
                 print(f"[websocket_client] connection error: {e}")
             finally:
                 self.connected = False

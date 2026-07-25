@@ -101,7 +101,15 @@ PUNCH_PATH_WINDOW_SEC = 0.35       # how far back to look for a punch trajectory
 PUNCH_MIN_NET_DISPLACEMENT = 0.10  # normalized distance, start-to-end of the window
 PUNCH_MIN_PEAK_SPEED = 0.60        # normalized units/sec, fastest single-frame segment in the window
 PUNCH_MIN_STRAIGHTNESS = 0.70      # net displacement / total path length (1.0 = perfectly straight)
-PUNCH_COOLDOWN_SEC = 0.5           # minimum time between two accepted placements
+
+# Cooldown starts long and shortens as B lands more punches this session --
+# a local count, not the live game score, so it needs no networking beyond
+# what already exists and doesn't depend on the host ever telling us the
+# score. Decays linearly from MAX down to MIN, floored so B can never spam
+# faster than MIN regardless of punch count.
+PUNCH_COOLDOWN_MAX_SEC = 0.9          # cooldown for B's very first punch
+PUNCH_COOLDOWN_MIN_SEC = 0.3          # floor -- never gets faster than this
+PUNCH_COOLDOWN_DECAY_PER_PUNCH = 0.03  # cooldown reduction per landed punch
 
 
 class PlayerBTracker:
@@ -137,9 +145,23 @@ class PlayerBTracker:
         self._last_punch_time = 0.0
         self._punch_wrist_xy = None
         self._height_wrist_xy = None
+        self.punch_count = 0
 
     def close(self):
         self._landmarker.close()
+
+    def reset_punch_count(self):
+        """Call this when a new round starts -- B has no way to know the
+        host reset the game (the protocol is one-way, B sends only), so
+        this has to be triggered locally instead of staying in sync
+        automatically."""
+        self.punch_count = 0
+
+    @property
+    def current_cooldown_sec(self):
+        """Cooldown for the *next* punch, given how many have landed so far."""
+        decayed = PUNCH_COOLDOWN_MAX_SEC - PUNCH_COOLDOWN_DECAY_PER_PUNCH * self.punch_count
+        return max(PUNCH_COOLDOWN_MIN_SEC, decayed)
 
     def process_frame(self, rgb_frame):
         """rgb_frame: HxWx3 RGB numpy array (already flipped/converted by caller).
@@ -247,7 +269,7 @@ class PlayerBTracker:
         self._last_peak_speed = peak_speed
         self._last_straightness = straightness
 
-        past_cooldown = (now - self._last_punch_time) >= PUNCH_COOLDOWN_SEC
+        past_cooldown = (now - self._last_punch_time) >= self.current_cooldown_sec
         if (
             past_cooldown
             and net_displacement >= PUNCH_MIN_NET_DISPLACEMENT
@@ -255,6 +277,7 @@ class PlayerBTracker:
             and straightness >= PUNCH_MIN_STRAIGHTNESS
         ):
             self._last_punch_time = now
+            self.punch_count += 1
             self._wrist_path.clear()  # don't let the same motion double-fire
             return {"lane": self.lane, "obstacle_type": self.obstacle_type}
 
@@ -277,11 +300,12 @@ class PlayerBTracker:
         cv2.putText(frame, f"obstacle: {self.obstacle_type} (L hand)", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, lane_color, 2)
 
-        cooldown_remaining = max(0.0, PUNCH_COOLDOWN_SEC - (time.time() - self._last_punch_time))
+        cooldown = self.current_cooldown_sec
+        cooldown_remaining = max(0.0, cooldown - (time.time() - self._last_punch_time))
         ready = cooldown_remaining <= 0
         state_color = (0, 255, 0) if ready else (0, 165, 255)
         state_text = "ready" if ready else f"cooldown {cooldown_remaining:.1f}s"
-        cv2.putText(frame, f"punch (R hand): {state_text}", (10, 90),
+        cv2.putText(frame, f"punch (R hand): {state_text}  [#{self.punch_count}, cd={cooldown:.2f}s]", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_color, 2)
         cv2.putText(
             frame,
