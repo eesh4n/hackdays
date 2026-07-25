@@ -29,7 +29,8 @@ import sys
 
 from ursina import (
     Ursina, Entity, Text, Sky, DirectionalLight, AmbientLight,
-    color, held_keys, destroy, curve, camera, window, application, time as ursina_time,
+    color, held_keys, destroy, curve, camera, window, application, invoke, Vec3,
+    time as ursina_time,
 )
 from ursina.shaders import lit_with_shadows_shader
 
@@ -108,6 +109,25 @@ SHIELD_DURATION_SEC = 2.0  # a shield lasts a fixed 2s once activated,
                            # regardless of how many hits it absorbs during
                            # that window -- not consumed by use
 SHIELD_COLOR = color.rgba32(120, 220, 255, 90)
+
+# Countdown before each run starts (also on restart after game over). This
+# isn't just cosmetic: PlayerATracker's JumpDuckDetector spends its first
+# ~15 frames calibrating a baseline before it'll fire jump/duck at all
+# (server/jump_duck_detector.py, WARMUP_FRAMES) -- without a countdown, a
+# player who reacts to the window opening by immediately jumping has that
+# very first input silently eaten. COUNTDOWN_SECONDS comfortably outlasts
+# the warmup at any real webcam frame rate.
+COUNTDOWN_SECONDS = 3.0
+COUNTDOWN_GO_HOLD_SEC = 0.4  # how long "GO!" stays up before hiding
+
+# Collision feedback: brief camera shake + player squash, both driven by
+# Ursina's own animate_* scheduling (see _trigger_collision_feedback) so
+# they keep playing after game_over stops Game.update() from running.
+SHAKE_DURATION = 0.35
+SHAKE_MAGNITUDE = 0.35   # world units of camera jitter
+SHAKE_STEPS = 6
+SQUASH_OUT_DURATION = 0.07
+SQUASH_RECOVER_DURATION = 0.18
 
 SKY_COLOR = color.rgb32(20, 15, 40)
 GROUND_COLOR = color.rgb32(30, 28, 40)
@@ -394,6 +414,10 @@ class Game:
             position=(0, -0.08), scale=1.4, color=color.rgb32(235, 235, 240), enabled=False,
             font=HUD_FONT,
         )
+        self.countdown_text = Text(
+            parent=camera.ui, text="", origin=(0, 0), position=(0, 0.1),
+            scale=4.5, color=color.rgb32(255, 255, 255), background=True, enabled=False,
+        )
 
     # --- lifecycle -------------------------------------------------------
 
@@ -415,6 +439,11 @@ class Game:
         self.gameover_text.enabled = False
         self.hint_text.enabled = False
 
+        self.countdown_active = True
+        self.countdown_remaining = COUNTDOWN_SECONDS
+        self.countdown_text.text = str(math.ceil(COUNTDOWN_SECONDS))
+        self.countdown_text.enabled = True
+
     def run(self):
         game = self
 
@@ -423,7 +452,9 @@ class Game:
                 if game.keyboard_fallback:
                     game._apply_keyboard_fallback()
                 dt = ursina_time.dt
-                if not game.game_over:
+                if game.countdown_active:
+                    game.update_countdown(dt)
+                elif not game.game_over:
                     game.update(dt)
                 game.draw()
 
@@ -466,6 +497,29 @@ class Game:
 
     # --- per-frame logic ---------------------------------------------------
 
+    def update_countdown(self, dt):
+        """Runs instead of update() while the "Get Ready" countdown is up.
+        Player A's live pose still drives the visible rig (so it's obvious
+        tracking is already working) and the camera/scenery keep animating,
+        but no obstacles/coins spawn or resolve. Player B's spawn events are
+        drained and discarded here rather than left to pile up, so punches
+        thrown during the countdown don't all land at once the instant it
+        ends."""
+        self.game_state.drain_spawn_events()
+        self._lane_a, self._action_a, self._pose_visible_a = self.game_state.get_player_a()
+
+        self._update_player(dt)
+        self._update_camera(dt)
+        self._update_scenery()
+
+        self.countdown_remaining -= dt
+        if self.countdown_remaining > 0:
+            self.countdown_text.text = str(math.ceil(self.countdown_remaining))
+        else:
+            self.countdown_active = False
+            self.countdown_text.text = "GO!"
+            invoke(setattr, self.countdown_text, "enabled", False, delay=COUNTDOWN_GO_HOLD_SEC)
+
     def update(self, dt):
         self.survived_sec += dt
         self.score += dt * 10
@@ -476,9 +530,22 @@ class Game:
 
         for _ in self.game_state.drain_shield_requests():
             self._try_activate_shield()
-        self._update_shield_timer(dt)
 
         self._lane_a, self._action_a, self._pose_visible_a = self.game_state.get_player_a()
+
+        # Player A's own shield trigger: PlayerATracker already detects a
+        # "block" pose (both wrists raised above shoulder height, see
+        # server/player_a_tracking.py) and reports it through the same
+        # direct GameState channel as lane/jump/duck -- no network hop
+        # needed since A is co-located with the game, unlike B's
+        # websocket-based shield request. Calling this every frame the
+        # pose holds is safe/idempotent: _try_activate_shield() itself
+        # already guards against re-activating while shield_active or
+        # spending coins twice.
+        if self._action_a == "block":
+            self._try_activate_shield()
+
+        self._update_shield_timer(dt)
 
         still_alive = []
         for obstacle in self.obstacles:
@@ -503,6 +570,7 @@ class Game:
                     else:
                         obstacle.z = Z_NEAR
                         self.game_over = True
+                        self._trigger_collision_feedback()
 
             obstacle.sync_transform()
 
@@ -587,6 +655,30 @@ class Game:
             else:
                 coin.destroy()
         self.coins = still_alive
+
+    def _trigger_collision_feedback(self):
+        """Camera shake + player squash on the exact frame a collision
+        fires. Both are built entirely from Ursina's animate_* scheduling
+        (not this file's own update()/draw() loop) since Game.update()
+        never runs again once game_over is set -- an effect that needed a
+        few more frames of a normal update() call to play out would just
+        freeze on frame one. animate_* keeps ticking on Ursina's own task
+        manager regardless."""
+        base = Vec3(self._camera_x, CAMERA_HEIGHT, -self.camera_back_offset)
+        step_duration = SHAKE_DURATION / SHAKE_STEPS
+        for i in range(1, SHAKE_STEPS + 1):
+            magnitude = SHAKE_MAGNITUDE * (1 - i / SHAKE_STEPS)
+            jitter = Vec3(random.uniform(-magnitude, magnitude), random.uniform(-magnitude, magnitude), 0)
+            camera.animate_position(base + jitter, duration=step_duration,
+                                     delay=step_duration * (i - 1), curve=curve.linear)
+        camera.animate_position(base, duration=step_duration,
+                                 delay=step_duration * SHAKE_STEPS, curve=curve.linear)
+
+        normal_scale = self.player.torso.scale
+        squashed_scale = Vec3(normal_scale.x * 1.35, normal_scale.y * 0.5, normal_scale.z * 1.25)
+        self.player.torso.animate_scale(squashed_scale, duration=SQUASH_OUT_DURATION, curve=curve.out_quad)
+        self.player.torso.animate_scale(normal_scale, duration=SQUASH_RECOVER_DURATION,
+                                         delay=SQUASH_OUT_DURATION, curve=curve.out_quad)
 
     def _try_activate_shield(self):
         """Called once per valid shield-activation message received over

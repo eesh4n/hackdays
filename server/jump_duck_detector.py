@@ -11,15 +11,32 @@ stays roughly constant. Normalizing the hip_y delta by the person's
 own torso length makes the thresholds self-calibrate to how close
 they're standing to the camera.
 
-Derived from recorded motion data (server/motion_log.csv,
-motion_log_jumps.csv): jumps land around -1.1x torso_len, ducks
-around +1.1x torso_len, standing noise stays under ~0.15x.
+Derived from recorded motion data. A dedicated small/quick-movement
+calibration (server/motion_log_small_jumps.csv, motion_log_small_ducks.csv --
+isolated jump-only and duck-only sessions, deliberately minimal-effort
+movements) found: quick jumps land at -0.42x torso_len or beyond, quick
+ducks at +0.12x to +0.54x (most clustering above +0.24x), and true
+standing noise stays within +-0.09x. Thresholds sit at roughly 2x the
+noise floor -- comfortably below real quick movements, comfortably
+above jitter.
+
+The very first frame is NOT used as the baseline outright -- if it
+catches the player mid-motion or not yet settled, every future delta
+would be measured against a bad reference and jump/duck could stop
+firing correctly for the rest of the session. Instead the first
+WARMUP_FRAMES frames fast-converge the baseline (higher alpha) before
+detection turns on.
 """
 
-JUMP_THRESHOLD = 0.6
-DUCK_THRESHOLD = 0.6
-RETURN_THRESHOLD = 0.3
+JUMP_THRESHOLD = 0.20
+DUCK_THRESHOLD = 0.18
+RETURN_THRESHOLD = 0.12
 BASELINE_ALPHA = 0.05
+
+WARMUP_FRAMES = 15
+WARMUP_ALPHA = 0.3
+
+MIN_TORSO_LEN = 0.05  # guards against a noisy frame's near-zero/negative torso_len blowing up the ratio
 
 
 class JumpDuckDetector:
@@ -33,15 +50,27 @@ class JumpDuckDetector:
         self.baseline_hip_y = None
         self.baseline_torso_len = None
         self.state = "neutral"  # "neutral", "jump", "duck"
+        self.last_normalized_delta = 0.0  # exposed for debug overlays
+
+        self._warmup_frames_left = WARMUP_FRAMES
 
     def update(self, hip_y, torso_len):
         """Feed one frame's hip_y / torso_len. Returns 'JUMP', 'DUCK', or None."""
+        torso_len = max(torso_len, MIN_TORSO_LEN)
+
         if self.baseline_hip_y is None:
             self.baseline_hip_y = hip_y
             self.baseline_torso_len = torso_len
             return None
 
+        if self._warmup_frames_left > 0:
+            self._warmup_frames_left -= 1
+            self.baseline_hip_y = (1 - WARMUP_ALPHA) * self.baseline_hip_y + WARMUP_ALPHA * hip_y
+            self.baseline_torso_len = (1 - WARMUP_ALPHA) * self.baseline_torso_len + WARMUP_ALPHA * torso_len
+            return None
+
         normalized_delta = (hip_y - self.baseline_hip_y) / self.baseline_torso_len
+        self.last_normalized_delta = normalized_delta
 
         event = None
         if self.state == "neutral":

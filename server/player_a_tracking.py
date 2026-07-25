@@ -37,9 +37,18 @@ LANE_COUNT = 3
 LANE_NAMES = ["LEFT", "CENTER", "RIGHT"]
 
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_WRIST, RIGHT_WRIST = 15, 16
 LEFT_HIP, RIGHT_HIP = 23, 24
 
 DETECTOR_STATE_TO_ACTION = {"neutral": "run", "jump": "jump", "duck": "duck"}
+
+# Block/shield: both wrists raised above shoulder height (a guard pose),
+# checked fresh every frame rather than tracked as a motion like jump/duck
+# -- it's a held pose, not a displacement to measure against a baseline.
+# Hysteresis (enter margin > exit margin) keeps it from flickering at the
+# boundary the same way lane switching does elsewhere in this file.
+BLOCK_ENTER_MARGIN = 0.05  # normalized y-units wrists must clear above shoulder_y to start blocking
+BLOCK_EXIT_MARGIN = 0.02   # margin required to drop back out of block once already blocking
 
 # A subset of BlazePose's 33 connections, enough to see the skeleton clearly.
 POSE_CONNECTIONS = [
@@ -104,6 +113,7 @@ class PlayerATracker:
 
         self._detector = JumpDuckDetector()
         self._last_landmarks = None
+        self._is_blocking = False
 
         self.lane = 1
         self.action = "run"
@@ -115,7 +125,7 @@ class PlayerATracker:
     def process_frame(self, rgb_frame):
         """rgb_frame: HxWx3 RGB numpy array (already flipped/converted by caller).
 
-        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"}
+        Returns: {"pose_visible": bool, "lane": 0|1|2, "action": "run"|"jump"|"duck"|"block"}
         """
         _, w = rgb_frame.shape[:2]
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -141,7 +151,15 @@ class PlayerATracker:
             torso_len = hip_y - shoulder_y
 
             self._detector.update(hip_y, torso_len)
-            self.action = DETECTOR_STATE_TO_ACTION[self._detector.state]
+            detector_action = DETECTOR_STATE_TO_ACTION[self._detector.state]
+
+            # Block takes priority: both wrists raised above shoulder height
+            # (a guard/shield pose) overrides whatever jump/duck landed on.
+            wrist_y = (landmarks[LEFT_WRIST].y + landmarks[RIGHT_WRIST].y) / 2
+            margin = BLOCK_EXIT_MARGIN if self._is_blocking else BLOCK_ENTER_MARGIN
+            self._is_blocking = (shoulder_y - wrist_y) > margin
+
+            self.action = "block" if self._is_blocking else detector_action
         else:
             self.pose_visible = False
             self._last_landmarks = None
@@ -174,11 +192,19 @@ class PlayerATracker:
             )
 
         action_color = {
-            "jump": (0, 200, 255), "duck": (255, 100, 0), "run": (0, 255, 136),
+            "jump": (0, 200, 255), "duck": (255, 100, 0),
+            "block": (255, 0, 200), "run": (0, 255, 136),
         }[self.action]
         cv2.putText(
             frame, f"action: {self.action}", (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX, 1.0, action_color, 2, cv2.LINE_AA
+        )
+        delta = self._detector.last_normalized_delta
+        cv2.putText(
+            frame,
+            f"delta: {delta:+.2f}  (jump < -{self._detector.jump_threshold:.2f}, "
+            f"duck > {self._detector.duck_threshold:.2f})",
+            (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA
         )
         return frame
 
