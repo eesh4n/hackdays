@@ -77,6 +77,10 @@ def run_camera_tracker(game_state, camera_index, stop_event):
     tracker = PlayerATracker()
     print("[main] Player A camera tracker running")
 
+    window_name = "Player A (runner) -- debug"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
     try:
         while not stop_event.is_set():
             ok, frame = cap.read()
@@ -87,10 +91,9 @@ def run_camera_tracker(game_state, camera_index, stop_event):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = tracker.process_frame(rgb)
             game_state.set_player_a(result["lane"], result["action"], result["pose_visible"])
-            game_state.set_player_a_debug(result["delta"], result["jump_threshold"], result["duck_threshold"])
 
             tracker.debug_overlay(frame)
-            cv2.imshow("Player A (runner) -- debug", frame)
+            cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 stop_event.set()
     finally:
