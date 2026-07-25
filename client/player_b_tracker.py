@@ -9,9 +9,9 @@ not a continuous value.
 
 Within whichever lane the player is standing in, hand height selects the
 obstacle type:
-  - hands up near/above shoulder height  -> HIGH obstacle
-  - hands at torso level (between shoulder and knee) -> MEDIUM obstacle
-  - hands down near/below knee height    -> LOW obstacle
+  - hands above head level          -> HIGH obstacle
+  - hands at shoulder/torso level (between head and waist) -> MEDIUM obstacle
+  - hands below waist level         -> LOW obstacle
 
 Lane and obstacle type are both just continuously-tracked *state* -- they
 don't fire anything by themselves. Placement fires only on a PUNCH gesture
@@ -33,6 +33,7 @@ from mediapipe.tasks.python import vision as mp_vision
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "pose_landmarker_lite.task"
 
 # Pose landmark indices (MediaPipe Pose topology)
+NOSE = 0
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_ELBOW, RIGHT_ELBOW = 13, 14
 LEFT_WRIST, RIGHT_WRIST = 15, 16
@@ -50,10 +51,11 @@ LANE_BOUNDARY_1 = 1 / 3
 LANE_BOUNDARY_2 = 2 / 3
 LANE_HYSTERESIS = 0.035  # widen/narrow the dead zone around each boundary
 
-# Obstacle-height thresholds, as a fraction of the shoulder-to-knee span,
-# measured down from the shoulder line. Smaller = closer to shoulders.
-HEIGHT_HIGH_FRAC = 0.25   # wrists above this fraction down from shoulders -> HIGH
-HEIGHT_LOW_FRAC = 0.80    # wrists below this fraction -> LOW, else MEDIUM
+# Obstacle-height boundaries: HIGH is above head (nose) level, LOW is below
+# waist (hip) level, and everything in between -- including shoulder height
+# -- is MEDIUM. A small margin keeps a wrist sitting exactly at head/waist
+# level from flip-flopping between two obstacle types every frame.
+HEIGHT_MARGIN = 0.02  # normalized y-units
 
 # Punch-gesture detection: a wrist's distance from its shoulder (normalized
 # 0-1 coords) has to grow faster than PUNCH_VELOCITY_THRESHOLD (units/sec)
@@ -163,19 +165,13 @@ class PlayerBTracker:
             return 1 if hip_x < b2_lo else 2
 
     def _compute_obstacle_type(self, lm):
-        shoulder_y = (lm[LEFT_SHOULDER].y + lm[RIGHT_SHOULDER].y) / 2
-        knee_y = (lm[LEFT_KNEE].y + lm[RIGHT_KNEE].y) / 2
+        head_y = lm[NOSE].y
+        waist_y = (lm[LEFT_HIP].y + lm[RIGHT_HIP].y) / 2
         wrist_y = min(lm[LEFT_WRIST].y, lm[RIGHT_WRIST].y)  # higher wrist wins (smaller y = higher up)
 
-        span = knee_y - shoulder_y
-        if span <= 0:
-            return self.obstacle_type  # degenerate pose read, keep last known value
-
-        frac_down = (wrist_y - shoulder_y) / span
-
-        if frac_down <= HEIGHT_HIGH_FRAC:
+        if wrist_y <= head_y + HEIGHT_MARGIN:
             return OBSTACLE_HIGH
-        elif frac_down >= HEIGHT_LOW_FRAC:
+        elif wrist_y >= waist_y - HEIGHT_MARGIN:
             return OBSTACLE_LOW
         else:
             return OBSTACLE_MEDIUM
