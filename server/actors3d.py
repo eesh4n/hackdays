@@ -175,7 +175,15 @@ class PlayerRig(Entity):
         self._t += dt
         self.current_action = action
 
-        if action == "duck":
+        if action == "block":
+            self.torso.scale = (0.62, TORSO_HEIGHT, 0.4)
+            self.torso.y = TORSO_CENTER_Y
+            self.head.y = HEAD_Y
+            self.left_arm.rotation = (-170, 0, 25)
+            self.right_arm.rotation = (-170, 0, -25)
+            self.left_leg.rotation = (0, 0, 0)
+            self.right_leg.rotation = (0, 0, 0)
+        elif action == "duck":
             self.torso.scale = (0.85, TORSO_HEIGHT * 0.55, 0.55)
             self.torso.y = HIP_Y + TORSO_HEIGHT * 0.55 / 2
             self.head.y = self.torso.y + TORSO_HEIGHT * 0.55 / 2 + 0.2

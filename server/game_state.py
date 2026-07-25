@@ -18,7 +18,7 @@ import threading
 import time
 
 VALID_LANES = (0, 1, 2)
-VALID_ACTIONS = ("run", "jump", "duck")
+VALID_ACTIONS = ("run", "jump", "duck", "block")
 VALID_OBSTACLE_TYPES = ("high", "medium", "low")
 
 
