@@ -1,16 +1,18 @@
 # RivalRuns
 
-A two-player, two-laptop endless runner where your body is the controller — for both players.
+A two-player, two-laptop endless runner where neither player touches a keyboard or controller.
 
-**Player A** runs down a 3-lane track by moving, jumping, and ducking in front of a webcam.
-**Player B** watches the track from a second laptop and places obstacles into A's lanes using
-hand gestures, trying to bring the run to an end. Coins scattered along the track bank into a
-shield that can block a hit.
+**Player A** dodges an incoming obstacle course with their whole body — step left/right to
+change lanes, jump, duck, or raise both arms to block. **Player B**, on a second laptop with
+its own webcam, actively places those obstacles in real time: reach into a "grab" zone on
+screen, close a fist, carry the grab down to a LOW/MEDIUM/HIGH "drop" zone, and release it.
+It's adversarial, not cooperative — B is trying to end A's run.
 
-Built on [Ursina](https://www.ursinaengine.org/) (Panda3D) for real 3D rendering and
-[MediaPipe](https://developers.google.com/mediapipe) for pose and hand tracking — no
-controllers or keyboard required for either player during a real match, though both sides
-have a keyboard fallback for testing without a camera.
+Rendered as a real 3D scene ([Ursina](https://www.ursinaengine.org/)/Panda3D) — chase-cam,
+procedural skyline, coin economy, and a shield mechanic — not a flat sprite game. Tracking is
+[MediaPipe](https://developers.google.com/mediapipe) pose + hand landmarks; no controllers or
+keyboard required for either player during a real match, though both sides have a keyboard
+fallback for testing without a camera.
 
 ---
 
@@ -25,11 +27,10 @@ Two laptops, one WebSocket connection between them:
 | Sends over the network | nothing | obstacle placements + shield requests |
 | Reads | Player A's own pose (local, no network hop) | — |
 
-Player A's tracking is **local** to the host laptop — there's no network round-trip between
-"A just jumped" and "the game sees it," since that latency directly decides whether an
-obstacle is dodged. Player B's placements travel over a WebSocket, since B is a genuinely
-separate machine watching a live feed of the track (not shown here, but assumed screen-shared
-or otherwise visible to B).
+Player A's tracker runs co-located with the game (direct function calls, no network hop) —
+that latency directly decides whether an obstacle is dodged. Player B runs on a separate
+machine and only ever sends one-way "place this obstacle" / "activate shield" messages over
+WebSocket; the game has no way to reply back to B today.
 
 ## Gameplay
 
@@ -47,14 +48,14 @@ or otherwise visible to B).
   zigzags that walk back and forth across lanes — and bank toward a shield.
 - **Shield**: costs 100 coins to activate, lasts a fixed 2 seconds once triggered, and breaks
   *any* collision while it's up. It isn't consumed by absorbing a hit — only the timer ends
-  it, so it can block multiple obstacles in a row if they arrive close together. It can be
-  triggered two ways: Player B sending a shield-activation message, or Player A raising both
-  arms above shoulder height (a guard pose) — whichever happens first.
+  it, so it can block multiple obstacles in a row if they arrive close together. Triggered
+  either by Player B sending a shield-activation message, or by Player A raising both arms
+  above shoulder height (a guard pose) — whichever happens first.
 - Score climbs the longer you survive, plus a bonus per coin. A session-best score is tracked
   live and called out with a "NEW BEST!" banner on death.
 - Collision detection is exact and rule-based, not physics: each obstacle is checked once, on
-  the precise frame it reaches the player, against a lookup table of lane + action + obstacle
-  type. See [Architecture notes](#architecture-notes) for why.
+  the precise frame it reaches the player, against the lookup table above. See
+  [Architecture notes](#architecture-notes) for why.
 
 ## Controls
 
@@ -76,7 +77,8 @@ or otherwise visible to B).
 | Choose its type | Carry it — fist still closed — down into one of the three zones below: left/center/right = low/medium/high |
 | Place it | Open your hand while inside a zone |
 
-Both `client/main.py` and `server/main.py` also support a manual keyboard fallback (see each
+Both hands work independently and simultaneously — alternate hands to place faster. Both
+`client/main.py` and `server/main.py` also support a manual keyboard fallback (see each
 file's own docstring for the exact keys) for testing without reliable tracking, or as a live
 backup if a camera acts up mid-demo.
 
@@ -105,12 +107,12 @@ RivalRuns/
 │   ├── websocket_server.py       accepts Player B's connection, routes incoming messages by
 │   │                            shape (obstacle placement vs. shield request)
 │   ├── player_a_tracking.py      Player A's pose tracker: lane, jump/duck, block/shield pose
-│   ├── jump_duck_detector.py     the jump/duck motion-detection algorithm, tuned from
-│   │                            recorded motion data
+│   ├── jump_duck_detector.py     self-calibrating baseline + threshold logic for jump/duck,
+│   │                            tuned from recorded motion data
 │   └── record_motion_data.py     dev tool used to capture that motion data
 ├── client/                    Laptop 2 — the obstacle placer
 │   ├── main.py                  entrypoint: camera loop, websocket client, keyboard fallback
-│   ├── player_b_tracker.py       hand + pose tracking, grab/drop gesture logic
+│   ├── player_b_tracker.py       two-handed grab/drop tracker (see technical notes below)
 │   └── websocket_client.py       auto-reconnecting websocket client
 ├── models/                    MediaPipe model files, checked in — no separate download step
 │   ├── pose_landmarker_lite.task
@@ -125,6 +127,8 @@ Both laptops need:
 - **Python 3.10, 3.11, or 3.12** — not 3.13+, MediaPipe doesn't reliably support it yet.
   Check what you have with `py -0p`.
 - A working webcam.
+- Two laptops on the same network — a phone hotspot tends to be more reliable than venue
+  WiFi for this.
 
 ```bash
 py -3.11 -m venv venv
@@ -135,6 +139,9 @@ pip install -r requirements.txt
 > Don't separately `pip install opencv-python` alongside the `opencv-contrib-python` that's
 > already in `requirements.txt` — they conflict and break camera access.
 
+The `models/` folder is already committed in this repo and needs to stay alongside `client/`
+and `server/` (i.e. at the repo root) — no separate download step.
+
 ## Running it
 
 **Laptop 1 (host / Player A):**
@@ -144,9 +151,11 @@ cd server
 python main.py
 ```
 
-Goes fullscreen at native resolution by default — the correct behavior for a monitor
-physically rotated to portrait via Windows Display Settings, since fullscreen then just picks
-up the already-swapped resolution automatically.
+Starts the 3D game window, Player A's camera tracker, and the WebSocket server (listens on
+port 8765 by default, and prints its own IP — that's what Player B connects to). Goes
+fullscreen at native resolution by default — the correct behavior for a monitor physically
+rotated to portrait via Windows Display Settings, since fullscreen then just picks up the
+already-swapped resolution automatically.
 
 | Flag | Effect |
 |---|---|
@@ -170,11 +179,11 @@ python main.py <HOST_IP> [--port 8765] [--camera N]
 A few decisions worth knowing about if you're picking this codebase back up:
 
 - **Collision detection is deterministic, not physics-based.** Each obstacle tracks its own
-  distance to the player; the exact frame it crosses zero is checked once, against the
-  lookup table above (lane match + action vs. obstacle type) — not a mesh-overlap test. This
-  was a deliberate choice: physics/collider-based detection on procedurally-scaled 3D meshes
-  is prone to jitter and near-miss ambiguity, where "the hit rules need to be perfect" matters
-  more than realistic physics.
+  distance to the player; the exact frame it crosses zero is checked once, against a lookup
+  table of lane + action + obstacle type — not a mesh-overlap test. This was a deliberate
+  choice: physics/collider-based detection on procedurally-scaled 3D meshes is prone to
+  jitter and near-miss ambiguity, where "the hit rules need to be perfect" matters more than
+  realistic physics.
 - **Ursina entities aren't automatically lit** just because a light exists in the scene —
   every lit surface in `actors3d.py`/`game.py` explicitly uses `lit_with_shadows_shader`, or
   Panda3D's fixed-function pipeline silently overrides its color with a flat white material
@@ -183,9 +192,21 @@ A few decisions worth knowing about if you're picking this codebase back up:
   sends; the host never replies, there's no acknowledgment, and B's client drops queued
   messages if the connection has been down too long. That's an acceptable trade for obstacle
   placements and shield requests — a dropped one is recoverable, a blocked game loop is not.
-- **Player A's camera thread writes directly into shared state** (`game_state.py`) rather
-  than going over a network, specifically because that input is latency-sensitive in a way
-  Player B's placements aren't.
+- **Player B's fist detection measures finger *joint angle*, not distance from the wrist.**
+  Distance-from-wrist looked reasonable at first but is rotation-sensitive — turning the hand
+  sideways to the camera changes those numbers with no actual finger movement. Joint bend
+  angle (using x/y/z, not just x/y) only depends on a finger's own two segments relative to
+  each other, so it reads the same regardless of hand orientation.
+- **Both of Player B's hands track independently and simultaneously**, each with its own
+  lock, debounce, and cooldown — a proximity-based matching step re-associates each frame's
+  detected hand(s) to the right tracking slot, so the two hands don't swap identities
+  mid-gesture.
+- **Distance thresholds (both players' lane detection, and Player B's hand-lock) are scaled
+  by the player's own shoulder width**, not fixed pixel/coordinate values — a fixed threshold
+  was too tight standing close to the camera and too loose standing far from it.
+- **Running pose and hand detection together, every frame, cost Player B a real ~10fps**
+  (mostly resource contention, not a hand-visibility problem). Sampling pose only every 8th
+  frame — lane doesn't need per-frame precision — recovered it to ~27fps.
 
 ## Known gaps
 
