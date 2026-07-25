@@ -30,11 +30,19 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
+from jump_duck_detector import JumpDuckDetector
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, "..", "models", "pose_landmarker_lite.task")
 
 LANE_COUNT = 3
 LANE_NAMES = ["LEFT", "CENTER", "RIGHT"]
+
+LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_HIP, RIGHT_HIP = 23, 24
+
+# How long a JUMP/DUCK banner stays on screen after it fires.
+EVENT_BANNER_MS = 600
 
 # A subset of BlazePose's 33 connections, enough to see the skeleton clearly.
 POSE_CONNECTIONS = [
@@ -105,6 +113,10 @@ def main():
     start_time_ms = int(time.time() * 1000)
     last_timestamp_ms = -1
 
+    detector = JumpDuckDetector()
+    last_event = None
+    last_event_time_ms = -EVENT_BANNER_MS
+
     try:
         while True:
             ok, frame = cap.read()
@@ -144,9 +156,20 @@ def main():
                     )
 
                 # Person's horizontal position = midpoint of the two hips.
-                left_hip_x, right_hip_x = points[23][0], points[24][0]
+                left_hip_x, right_hip_x = points[LEFT_HIP][0], points[RIGHT_HIP][0]
                 center_x = (left_hip_x + right_hip_x) // 2
                 current_lane = min(center_x // lane_width, LANE_COUNT - 1)
+
+                # Jump/duck detection from normalized (0-1) landmark y-values.
+                hip_y = (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y) / 2
+                shoulder_y = (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y) / 2
+                torso_len = hip_y - shoulder_y
+
+                event = detector.update(hip_y, torso_len)
+                if event:
+                    last_event = event
+                    last_event_time_ms = timestamp_ms
+                    print(f"[{timestamp_ms}ms] {event}")
             else:
                 cv2.putText(
                     frame, "No person detected", (20, 80),
@@ -154,6 +177,15 @@ def main():
                 )
 
             draw_lanes(frame, lane_width, LANE_COUNT, current_lane)
+
+            if last_event and timestamp_ms - last_event_time_ms < EVENT_BANNER_MS:
+                color = (0, 200, 255) if last_event == "JUMP" else (255, 100, 0)
+                text_size = cv2.getTextSize(last_event, cv2.FONT_HERSHEY_SIMPLEX, 3.0, 6)[0]
+                text_x = (w - text_size[0]) // 2
+                cv2.putText(
+                    frame, last_event, (text_x, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 3.0, color, 6, cv2.LINE_AA
+                )
 
             cv2.imshow(window_name, frame)
 
