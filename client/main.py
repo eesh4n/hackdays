@@ -3,11 +3,13 @@ Player B entrypoint -- runs on Laptop 2 ("the obstacle placer").
 
 Opens the webcam, runs the lane + obstacle-height tracker, and sends a
 placement event over WebSocket to the game host every time Player B
-punches. Also draws a debug preview window (lane dividers, current
-lane/obstacle state, punch-armed indicator) so you can see what's being
-tracked live -- worth leaving on even during the real demo, just moved
-off to the side, since it's the fastest way to tell if tracking is
-misbehaving before a judge notices.
+punches -- a short beep and a fading trail of the punching wrist confirm
+each placement locally, independent of whether the network delivery
+actually succeeds. Also draws a debug preview window (lane dividers,
+current lane/obstacle state, punch-armed indicator, last-successful-send
+age) so you can see what's being tracked live -- worth leaving on even
+during the real demo, just moved off to the side, since it's the fastest
+way to tell if tracking is misbehaving before a judge notices.
 
 Usage:
     python main.py <server_ip> [--port 8765] [--camera 0]
@@ -27,6 +29,9 @@ tracking dies mid-demo, not just for hour-0 testing):
 """
 import argparse
 import sys
+import threading
+import time
+import winsound
 
 import cv2
 
@@ -34,6 +39,18 @@ from player_b_tracker import PlayerBTracker, LANE_NAMES, OBSTACLE_HIGH, OBSTACLE
 from websocket_client import WebSocketClient, DEFAULT_PORT
 
 WINDOW_NAME = "Player B (obstacle placer)"
+
+PUNCH_BEEP_FREQ_HZ = 880
+PUNCH_BEEP_DURATION_MS = 80
+
+
+def _play_punch_beep():
+    """winsound.Beep blocks the calling thread for its whole duration, so
+    it runs on a short-lived daemon thread -- the camera loop must never
+    stall waiting on a beep, even a short one, at 30fps."""
+    threading.Thread(
+        target=winsound.Beep, args=(PUNCH_BEEP_FREQ_HZ, PUNCH_BEEP_DURATION_MS), daemon=True
+    ).start()
 
 
 def parse_args():
@@ -90,6 +107,7 @@ def main():
                     "lane": effective_lane,
                     "obstacle": effective_obstacle,
                 })
+                _play_punch_beep()
                 print(f"[main] >> placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
 
             tracker.debug_overlay(frame)
@@ -97,6 +115,19 @@ def main():
             conn_text = "connected" if client.connected else "reconnecting..."
             cv2.putText(frame, conn_text, (10, frame.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
+
+            if client.last_sent_at is None:
+                sent_text = "last sent: never"
+                sent_color = (0, 165, 255)
+            else:
+                age = time.time() - client.last_sent_at
+                sent_text = f"last sent: {age:.1f}s ago"
+                # Stale send (queued but not actually delivered in a while)
+                # is a subtler failure than a dropped connection -- flag it
+                # even if `connected` still reads True.
+                sent_color = (0, 255, 0) if age < 3.0 else (0, 165, 255)
+            cv2.putText(frame, sent_text, (10, frame.shape[0] - 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, sent_color, 1)
             if manual_lane is not None or manual_obstacle is not None:
                 cv2.putText(frame, "MANUAL OVERRIDE ACTIVE", (10, frame.shape[0] - 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
@@ -133,6 +164,7 @@ def main():
                     "lane": effective_lane,
                     "obstacle": effective_obstacle,
                 })
+                _play_punch_beep()
                 print(f"[main] >> (manual) placed {effective_obstacle} obstacle in lane {LANE_NAMES[effective_lane]}")
 
     finally:

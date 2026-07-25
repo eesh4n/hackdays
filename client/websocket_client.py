@@ -48,6 +48,10 @@ class WebSocketClient:
 
         self.connected = False
         self._seq = 0
+        self.last_sent_at = None  # wall-clock time of the last message actually
+                                   # written to the socket (not just enqueued) --
+                                   # lets the UI distinguish "connected but queue
+                                   # is backing up" from "actually delivering".
 
     def start(self):
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -117,6 +121,7 @@ class WebSocketClient:
                 continue
             try:
                 await ws.send(json.dumps(message))
+                self.last_sent_at = time.time()
             except websockets.exceptions.ConnectionClosed:
                 # Put it back so it isn't silently lost across a reconnect.
                 try:

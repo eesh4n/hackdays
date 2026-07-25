@@ -101,15 +101,16 @@ PUNCH_PATH_WINDOW_SEC = 0.35       # how far back to look for a punch trajectory
 PUNCH_MIN_NET_DISPLACEMENT = 0.10  # normalized distance, start-to-end of the window
 PUNCH_MIN_PEAK_SPEED = 0.60        # normalized units/sec, fastest single-frame segment in the window
 PUNCH_MIN_STRAIGHTNESS = 0.70      # net displacement / total path length (1.0 = perfectly straight)
+PUNCH_TRAIL_DISPLAY_SEC = 0.4      # how long the fading trail stays on screen after a punch
 
 # Cooldown starts long and shortens as B lands more punches this session --
 # a local count, not the live game score, so it needs no networking beyond
 # what already exists and doesn't depend on the host ever telling us the
 # score. Decays linearly from MAX down to MIN, floored so B can never spam
 # faster than MIN regardless of punch count.
-PUNCH_COOLDOWN_MAX_SEC = 0.9          # cooldown for B's very first punch
-PUNCH_COOLDOWN_MIN_SEC = 0.3          # floor -- never gets faster than this
-PUNCH_COOLDOWN_DECAY_PER_PUNCH = 0.03  # cooldown reduction per landed punch
+PUNCH_COOLDOWN_MAX_SEC = 0.9           # cooldown for B's very first punch
+PUNCH_COOLDOWN_MIN_SEC = 0.5           # floor -- never gets faster than this
+PUNCH_COOLDOWN_DECAY_PER_PUNCH = 0.006  # cooldown reduction per landed punch
 
 
 class PlayerBTracker:
@@ -146,6 +147,13 @@ class PlayerBTracker:
         self._punch_wrist_xy = None
         self._height_wrist_xy = None
         self.punch_count = 0
+
+        # Snapshot of the wrist path at the instant a punch fires, kept
+        # around just long enough to draw a fading trail -- _wrist_path
+        # itself gets cleared the moment a punch fires (see below), so the
+        # overlay can't read the path that actually triggered it directly.
+        self._punch_trail = []
+        self._punch_trail_time = 0.0
 
     def close(self):
         self._landmarker.close()
@@ -278,6 +286,8 @@ class PlayerBTracker:
         ):
             self._last_punch_time = now
             self.punch_count += 1
+            self._punch_trail = pts  # snapshot before clearing, for the fading-trail overlay
+            self._punch_trail_time = now
             self._wrist_path.clear()  # don't let the same motion double-fire
             return {"lane": self.lane, "obstacle_type": self.obstacle_type}
 
@@ -332,4 +342,15 @@ class PlayerBTracker:
             cv2.circle(frame, (int(px * w), int(py * h)), 10, (0, 100, 255), -1)
             cv2.putText(frame, "PUNCH", (int(px * w) + 14, int(py * h) + 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 2)
+
+        # Fading trail of the wrist path that triggered the most recent
+        # punch -- purely cosmetic, but confirms visually (not just via the
+        # text readout) exactly what motion the detector accepted.
+        trail_age = time.time() - self._punch_trail_time
+        if self._punch_trail and trail_age < PUNCH_TRAIL_DISPLAY_SEC:
+            fade = 1.0 - (trail_age / PUNCH_TRAIL_DISPLAY_SEC)
+            color = (0, int(255 * fade), int(255 * fade))
+            pts_px = [(int(x * w), int(y * h)) for (_, x, y) in self._punch_trail]
+            for p0, p1 in zip(pts_px, pts_px[1:]):
+                cv2.line(frame, p0, p1, color, max(1, int(4 * fade)))
         return frame
