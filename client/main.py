@@ -28,6 +28,8 @@ tracking dies mid-demo, not just for hour-0 testing):
     r           -- reset placement count (cooldown scaling starts over --
                    use this at the start of each new round, since B has
                    no way to know the host restarted automatically)
+    c           -- clear manual override, hand control back to the camera
+                   (previously the only way back was restarting the script)
     q           -- quit
 """
 import argparse
@@ -79,7 +81,7 @@ def main():
 
     print(f"[main] connecting out to {args.server_ip}:{args.port} ...")
     print("[main] keyboard fallback: 1/2/3 = lane, h/m/l = manual grab, SPACE = force-place, "
-          "f = fullscreen, r = reset placement count, q = quit")
+          "f = fullscreen, r = reset placement count, c = clear override, q = quit")
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
@@ -120,9 +122,16 @@ def main():
                       f"in lane {LANE_NAMES[result['event']['lane']]}")
 
             tracker.debug_overlay(frame)
+
+            # Drawn bottom-RIGHT, deliberately -- tracker.debug_overlay()
+            # owns the whole bottom-left column for its own status lines,
+            # and stacking both files' text in the same corner is exactly
+            # what caused them to overlap before.
+            w = frame.shape[1]
+            right_x = w - 260
             conn_color = (0, 255, 0) if client.connected else (0, 0, 255)
             conn_text = "connected" if client.connected else "reconnecting..."
-            cv2.putText(frame, conn_text, (10, frame.shape[0] - 15),
+            cv2.putText(frame, conn_text, (right_x, frame.shape[0] - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
 
             if client.last_sent_at is None:
@@ -135,10 +144,10 @@ def main():
                 # is a subtler failure than a dropped connection -- flag it
                 # even if `connected` still reads True.
                 sent_color = (0, 255, 0) if age < 3.0 else (0, 165, 255)
-            cv2.putText(frame, sent_text, (10, frame.shape[0] - 65),
+            cv2.putText(frame, sent_text, (right_x, frame.shape[0] - 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, sent_color, 1)
             if manual_lane is not None or manual_obstacle is not None:
-                cv2.putText(frame, "MANUAL OVERRIDE ACTIVE", (10, frame.shape[0] - 40),
+                cv2.putText(frame, "MANUAL OVERRIDE", (right_x, frame.shape[0] - 75),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             cv2.imshow(WINDOW_NAME, frame)
@@ -167,6 +176,10 @@ def main():
             elif key == ord('r'):
                 tracker.reset_placement_count()
                 print("[main] placement count reset -- cooldown scaling starts over")
+            elif key == ord('c'):
+                manual_lane = None
+                manual_obstacle = None
+                print("[main] manual override cleared -- back to camera control")
             elif key == ord(' ') and effective_obstacle is not None:
                 client.send({
                     "player": "B",

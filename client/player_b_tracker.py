@@ -74,11 +74,34 @@ FIST_MIN_CURLED_FINGERS = 3  # of 4, majority vote
 
 POSE_SAMPLE_EVERY_N_FRAMES = 5  # lane only needs occasional updates, not every frame
 
+# Hand-lock tuning. A locked candidate is only accepted if its palm sits
+# within this normalized distance of the last known position -- without a
+# ceiling, "pick whichever candidate is closest" will still confidently
+# adopt a completely different hand (or person) if that's all that's on
+# screen, since "closest" has no concept of "too far to plausibly be the
+# same hand between two frames".
+MAX_LOCK_JUMP_DIST = 0.15
+
+# If the tracked hand goes fully undetected for this long, drop whatever
+# was being carried rather than risk a "phantom drop" firing wherever the
+# hand happens to reappear (e.g. back at the player's side, not a real
+# gesture) once tracking resumes.
+HAND_LOST_CANCEL_CARRY_SEC = 0.6
+# If undetected for even longer than that, give up the lock entirely --
+# the next detection is treated as a fresh first-ever acquisition rather
+# than something that must match a stale remembered position.
+HAND_LOST_FORGET_LOCK_SEC = 1.0
+
+# The fist-closed reading is a coarse per-frame heuristic and can flicker
+# for a single frame even mid-gesture. Requiring it to read "open" for
+# this many consecutive frames before treating it as a real release stops
+# one noisy frame from silently cancelling an entire carry.
+OPEN_DEBOUNCE_FRAMES = 2
+
 LANE_NAMES = ("left", "center", "right")
 OBSTACLE_HIGH = "high"
 OBSTACLE_MEDIUM = "medium"
 OBSTACLE_LOW = "low"
-OBSTACLE_TYPES = (OBSTACLE_HIGH, OBSTACLE_MEDIUM, OBSTACLE_LOW)
 
 # Lane boundaries as fraction of frame width, with a hysteresis band so
 # standing near a boundary doesn't flicker between two lanes every frame.
@@ -111,7 +134,7 @@ PLACEMENT_COOLDOWN_DECAY_PER_PLACEMENT = 0.006
 
 
 class PlayerBTracker:
-    """Feed frames in with process_frame(); poll .lane / .carried_obstacle /
+    """Feed frames in with process_frame(); poll .lane / .is_carrying /
     .fist_closed for live state each frame, and check the returned event
     for a placement."""
 
@@ -142,6 +165,8 @@ class PlayerBTracker:
             )
         )
         self._locked_palm_xy = None  # last known position of the hand we're tracking
+        self._hand_lost_since = None  # timestamp the hand FIRST went undetected, or None if currently seen
+        self._fist_open_streak = 0    # consecutive frames read "open" while carrying, for debounce
         self._start_time = time.time()
         self._frame_count = 0
 
@@ -205,19 +230,24 @@ class PlayerBTracker:
                 self.pose_visible = False
 
         hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-        event = None
+        selected = None
         if hand_result.hand_landmarks:
+            # None means the model found a hand (or two), but neither is
+            # close enough to our last known position to plausibly be the
+            # SAME hand -- treated the same as no detection at all, rather
+            # than blindly adopting whatever showed up.
+            selected = self._select_locked_hand(hand_result.hand_landmarks)
+
+        event = None
+        if selected is not None:
             self.hand_visible = True
-            hand_lm = self._select_locked_hand(hand_result.hand_landmarks)
-            self.hand_xy = _palm_center(hand_lm)
+            self._hand_lost_since = None
+            self.hand_xy = _palm_center(selected)
             self._locked_palm_xy = self.hand_xy
-            self.fist_closed = _is_fist(hand_lm)
+            self.fist_closed = _is_fist(selected)
             event = self._update_grab_place_state(now)
         else:
-            self.hand_visible = False
-            self.hand_xy = None
-            self._locked_palm_xy = None  # hand fully lost -- next detection re-acquires fresh
-            self.fist_closed = False
+            self._handle_hand_not_visible(now)
 
         return {
             "pose_visible": self.pose_visible,
@@ -229,22 +259,60 @@ class PlayerBTracker:
 
     def _select_locked_hand(self, all_hand_landmarks):
         """Given 1-2 detected hands this frame, picks whichever one we're
-        actually tracking. If we have no prior lock (first detection, or
-        just re-acquired after losing the hand entirely), take the first
-        candidate. Otherwise, lock onto whichever candidate's palm is
-        closest to where our tracked hand was last seen -- this is what
-        stops a second hand (or someone walking through frame) from
-        hijacking tracking just because the model happened to rank it
-        first that frame."""
-        if len(all_hand_landmarks) == 1 or self._locked_palm_xy is None:
+        actually tracking, or None if nothing qualifies.
+
+        With no prior lock (first-ever detection, or the lock has been
+        given up after a long enough gap -- see HAND_LOST_FORGET_LOCK_SEC),
+        the first candidate is trusted outright; there's nothing to compare
+        it against yet.
+
+        With a prior lock, this does NOT just trust whichever candidate is
+        closest -- distance alone doesn't distinguish "this is the same
+        hand, slightly moved" from "this is a completely different hand
+        that happens to be nearest of the options available". A candidate
+        is only accepted if it's within MAX_LOCK_JUMP_DIST of the last
+        known position; a single detected hand still has to clear this bar,
+        not just multiple candidates (a normal single-player frame usually
+        has exactly one hand detected, so gating only the multi-candidate
+        case would leave the common failure mode -- the tracked hand
+        leaving frame and a different hand becoming the sole detection --
+        completely unguarded)."""
+        if self._locked_palm_xy is None:
             return all_hand_landmarks[0]
 
         lx, ly = self._locked_palm_xy
-        best = min(
-            all_hand_landmarks,
-            key=lambda lm: (_palm_center(lm)[0] - lx) ** 2 + (_palm_center(lm)[1] - ly) ** 2,
-        )
+
+        def _dist_sq(lm):
+            px, py = _palm_center(lm)
+            return (px - lx) ** 2 + (py - ly) ** 2
+
+        best = min(all_hand_landmarks, key=_dist_sq)
+        if _dist_sq(best) > MAX_LOCK_JUMP_DIST ** 2:
+            return None
         return best
+
+    def _handle_hand_not_visible(self, now):
+        """Called when no hand landmarks were detected this frame, OR a
+        hand was detected but didn't pass the lock's distance gate (see
+        _select_locked_hand) -- both cases mean "we don't currently have a
+        trustworthy read on our tracked hand", handled identically."""
+        self.hand_visible = False
+        self.hand_xy = None
+        self.fist_closed = False
+        self._fist_open_streak = 0
+
+        if self._hand_lost_since is None:
+            self._hand_lost_since = now
+        lost_duration = now - self._hand_lost_since
+
+        if self.is_carrying and lost_duration >= HAND_LOST_CANCEL_CARRY_SEC:
+            # Don't leave a carry to be silently "placed" wherever the hand
+            # happens to reappear once tracking resumes -- that's a
+            # tracking hiccup, not a real drop gesture.
+            self.is_carrying = False
+
+        if lost_duration >= HAND_LOST_FORGET_LOCK_SEC:
+            self._locked_palm_xy = None
 
     def _update_lane(self, lm):
         hip_x = (lm[LEFT_HIP].x + lm[RIGHT_HIP].x) / 2
@@ -281,20 +349,34 @@ class PlayerBTracker:
     def _update_grab_place_state(self, now):
         """Level-triggered, not edge-triggered: the fist just needs to BE
         closed while in the grab zone -- it doesn't matter whether it
-        closed before or after entering the zone, both grab. Same for
-        drop. is_carrying flipping True/False is itself the one-shot
-        guard against re-firing every frame the condition holds, so this
-        doesn't need to track a previous-frame fist state to detect a
-        precise transition anymore -- that precise-timing requirement was
-        most of what made grabbing/dropping feel clunky."""
+        closed before or after entering the zone, both grab. is_carrying
+        flipping True is itself the one-shot guard against re-firing every
+        frame the condition holds, so this doesn't need to track a
+        previous-frame fist state to detect a precise transition -- that
+        precise-timing requirement was most of what made grabbing feel
+        clunky.
+
+        Dropping is level-triggered too, but debounced: fist-open has to
+        hold for OPEN_DEBOUNCE_FRAMES consecutive frames before it counts
+        as a real release. Without this, a single misdetected frame mid-
+        carry (fist briefly reads "open" while still up in the grab strip,
+        nowhere near a drop zone) would silently cancel the whole carry --
+        the fist-closed heuristic is a coarse per-frame geometric read and
+        will flicker occasionally even mid-gesture."""
         x, y = self.hand_xy
         event = None
 
         if not self.is_carrying:
+            self._fist_open_streak = 0  # not relevant yet -- don't let a stale streak leak into the next carry
             if self.fist_closed and self._in_grab_zone(y):
                 self.is_carrying = True
         else:
-            if not self.fist_closed:
+            if self.fist_closed:
+                self._fist_open_streak = 0
+            else:
+                self._fist_open_streak += 1
+
+            if self._fist_open_streak >= OPEN_DEBOUNCE_FRAMES:
                 drop_type = self._drop_zone_at(x, y)
                 past_cooldown = (now - self._last_placement_time) >= self.current_cooldown_sec
                 if drop_type is not None and past_cooldown:
@@ -309,6 +391,7 @@ class PlayerBTracker:
                 # the hand is empty again either way. Don't leave it
                 # "stuck" carrying; the player can just grab again.
                 self.is_carrying = False
+                self._fist_open_streak = 0
 
         return event
 
