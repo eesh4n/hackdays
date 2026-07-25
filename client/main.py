@@ -10,11 +10,10 @@ hands work independently and simultaneously, each with its own cooldown,
 so alternating hands lets you place obstacles back-to-back without
 waiting on a single shared timer. A short beep confirms each placement
 locally, independent of whether the network delivery actually succeeds.
-Also draws a debug preview window (grab strip, drop zones, lane, both
-hands' state, last-successful-send age) so you can see what's being
-tracked live -- worth leaving on even during the real demo, just moved
-off to the side, since it's the fastest way to tell if tracking is
-misbehaving before a judge notices.
+Also draws a live preview window (hand skeletons, grab strip, drop zones,
+lane) so you can see what's being tracked -- worth leaving on even during
+the real demo, just moved off to the side, since it's the fastest way to
+tell if tracking is misbehaving before a judge notices.
 
 Usage:
     python main.py <server_ip> [--port 8765] [--camera 0]
@@ -38,7 +37,6 @@ tracking dies mid-demo, not just for hour-0 testing):
 import argparse
 import sys
 import threading
-import time
 import winsound
 
 import cv2
@@ -139,31 +137,9 @@ def main():
 
             tracker.debug_overlay(frame)
 
-            # Drawn bottom-RIGHT, deliberately -- tracker.debug_overlay()
-            # owns the whole bottom-left column for its own status lines,
-            # and stacking both files' text in the same corner is exactly
-            # what caused them to overlap before.
-            w = frame.shape[1]
-            right_x = w - 260
-            conn_color = (0, 255, 0) if client.connected else (0, 0, 255)
-            conn_text = "connected" if client.connected else "reconnecting..."
-            cv2.putText(frame, conn_text, (right_x, frame.shape[0] - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_color, 2)
-
-            if client.last_sent_at is None:
-                sent_text = "last sent: never"
-                sent_color = (0, 165, 255)
-            else:
-                age = time.time() - client.last_sent_at
-                sent_text = f"last sent: {age:.1f}s ago"
-                # Stale send (queued but not actually delivered in a while)
-                # is a subtler failure than a dropped connection -- flag it
-                # even if `connected` still reads True.
-                sent_color = (0, 255, 0) if age < 3.0 else (0, 165, 255)
-            cv2.putText(frame, sent_text, (right_x, frame.shape[0] - 45),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, sent_color, 1)
             if manual_lane is not None or manual_obstacle is not None:
-                cv2.putText(frame, "MANUAL OVERRIDE", (right_x, frame.shape[0] - 75),
+                w = frame.shape[1]
+                cv2.putText(frame, "MANUAL OVERRIDE", (w - 260, frame.shape[0] - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             cv2.imshow(WINDOW_NAME, frame)
