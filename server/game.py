@@ -447,9 +447,22 @@ class Game:
 
         for _ in self.game_state.drain_shield_requests():
             self._try_activate_shield()
-        self._update_shield_timer(dt)
 
         self._lane_a, self._action_a, self._pose_visible_a = self.game_state.get_player_a()
+
+        # Player A's own shield trigger: PlayerATracker already detects a
+        # "block" pose (both wrists raised above shoulder height, see
+        # server/player_a_tracking.py) and reports it through the same
+        # direct GameState channel as lane/jump/duck -- no network hop
+        # needed since A is co-located with the game, unlike B's
+        # websocket-based shield request. Calling this every frame the
+        # pose holds is safe/idempotent: _try_activate_shield() itself
+        # already guards against re-activating while shield_active or
+        # spending coins twice.
+        if self._action_a == "block":
+            self._try_activate_shield()
+
+        self._update_shield_timer(dt)
 
         still_alive = []
         for obstacle in self.obstacles:
