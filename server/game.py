@@ -69,10 +69,19 @@ BUILDING_MIN_DIST = 55
 BUILDING_MAX_DIST = 110
 STAR_COUNT = 60
 
-COIN_SPAWN_INTERVAL_MIN = 1.1
-COIN_SPAWN_INTERVAL_MAX = 2.2
+COIN_SPAWN_INTERVAL_MIN = 1.8
+COIN_SPAWN_INTERVAL_MAX = 3.2
 COIN_SCORE_VALUE = 25
 COIN_SPIN_SPEED = 220  # degrees/sec
+COIN_ROW_MIN = 5     # a "run" of coins in one lane, Subway-Surfers style,
+COIN_ROW_MAX = 8     # instead of one lone coin per spawn
+COIN_ROW_SPACING_Z = 1.5
+
+SHIELD_COIN_COST = 100    # coins required to activate a shield
+SHIELD_DURATION_SEC = 2.0  # a shield lasts a fixed 2s once activated,
+                           # regardless of how many hits it absorbs during
+                           # that window -- not consumed by use
+SHIELD_COLOR = color.rgba32(120, 220, 255, 90)
 
 # Countdown before each run starts (also on restart after game over). This
 # isn't just cosmetic: PlayerATracker's JumpDuckDetector spends its first
@@ -163,12 +172,14 @@ class Obstacle:
 class Coin:
     """A collectible spawned by the game itself (not placed by Player B)
     -- picked up just by being in the right lane when it arrives,
-    regardless of jump/duck, same as a real endless runner."""
+    regardless of jump/duck, same as a real endless runner. Normally
+    spawned in a row (see Game._spawn_coin_row) with a staggered
+    starting z, Subway-Surfers style, rather than one at a time."""
     __slots__ = ("lane", "z", "entity", "resolved")
 
-    def __init__(self, lane):
+    def __init__(self, lane, z=Z_FAR):
         self.lane = lane
-        self.z = Z_FAR
+        self.z = z
         self.entity = actors3d.build_coin()
         self.entity.x = lane_x(lane)
         self.entity.z = self.z
@@ -282,6 +293,8 @@ class Game:
         self.player = actors3d.PlayerRig(position=(lane_x(1), 0, 0))
         self._glow = Entity(model="circle", color=PLAYER_GLOW_COLOR, rotation_x=90,
                              scale=LANE_WIDTH * 0.95, y=0.02)
+        self._shield_bubble = Entity(parent=self.player, model="sphere", color=SHIELD_COLOR,
+                                      scale=1.7, y=0.9, unlit=True, enabled=False)
 
         # window.aspect_ratio reflects the real fullscreen resolution at this
         # point (native, whatever orientation the monitor/OS is set to) --
@@ -301,6 +314,10 @@ class Game:
         self.coins_text = Text(
             parent=camera.ui, text="Coins: 0", position=(-0.85, 0.39), scale=1.2,
             color=color.rgb32(255, 210, 60), background=True,
+        )
+        self.shield_text = Text(
+            parent=camera.ui, text=f"Shield: 0/{SHIELD_COIN_COST}", position=(-0.85, 0.33), scale=1.2,
+            color=color.rgb32(120, 220, 255), background=True,
         )
         self.warn_text = Text(
             parent=camera.ui, text="Player A pose not detected -- using last known state",
@@ -329,6 +346,8 @@ class Game:
             coin.destroy()
         self.coins = []
         self.coins_collected = 0
+        self.shield_active = False
+        self.shield_timer = 0.0
         self._next_coin_spawn = random.uniform(COIN_SPAWN_INTERVAL_MIN, COIN_SPAWN_INTERVAL_MAX)
         self.score = 0.0
         self.survived_sec = 0.0
@@ -362,6 +381,15 @@ class Game:
                     sys.exit(0)
                 elif key == "r" and game.game_over:
                     game.reset()
+                elif key == "e":
+                    # Stands in for Player B's real shield gesture -- goes
+                    # through the exact same GameState entrypoint a real
+                    # websocket message would (still gated by game.py's own
+                    # >=100 coins / no-stacking rules), so it's available in
+                    # both --no-camera testing AND with the real camera
+                    # running, as a manual fallback if Player B's gesture
+                    # isn't wired up yet for a demo.
+                    game.game_state.push_shield_request({"player": "B", "action": "shield"})
                 elif game.keyboard_fallback:
                     if key in ("left arrow", "a"):
                         game._kb_lane = max(0, game._kb_lane - 1)
@@ -417,6 +445,10 @@ class Game:
         for event in self.game_state.drain_spawn_events():
             self.obstacles.append(Obstacle(event["lane"], event["obstacle"]))
 
+        for _ in self.game_state.drain_shield_requests():
+            self._try_activate_shield()
+        self._update_shield_timer(dt)
+
         self._lane_a, self._action_a, self._pose_visible_a = self.game_state.get_player_a()
 
         still_alive = []
@@ -433,9 +465,16 @@ class Game:
             if not obstacle.resolved and prev_z > Z_NEAR >= obstacle.z:
                 obstacle.resolved = True
                 if obstacle.lane == self._lane_a and not avoided(self._action_a, obstacle.kind):
-                    obstacle.z = Z_NEAR
-                    self.game_over = True
-                    self._trigger_collision_feedback()
+                    if self.shield_active:
+                        # The shield breaks the collision -- the obstacle
+                        # shatters instead of ending the run. It stays
+                        # active (time-based only, see _update_shield_timer)
+                        # so it can absorb further hits until it expires.
+                        obstacle.z = self.remove_z - 1  # marks it for cleanup below
+                    else:
+                        obstacle.z = Z_NEAR
+                        self.game_over = True
+                        self._trigger_collision_feedback()
 
             obstacle.sync_transform()
 
@@ -453,11 +492,20 @@ class Game:
         if self.game_over:
             self._show_game_over()
 
+    def _spawn_coin_row(self):
+        """A run of several coins in one lane, staggered in z so they file
+        in and get collected one after another -- the classic Subway
+        Surfers "coin trail" look, instead of one lone coin at a time."""
+        lane = random.randint(0, LANE_COUNT - 1)
+        row_len = random.randint(COIN_ROW_MIN, COIN_ROW_MAX)
+        for i in range(row_len):
+            self.coins.append(Coin(lane, z=Z_FAR + i * COIN_ROW_SPACING_Z))
+
     def _update_coins(self, dt, speed):
         self._next_coin_spawn -= dt
         if self._next_coin_spawn <= 0:
             self._next_coin_spawn = random.uniform(COIN_SPAWN_INTERVAL_MIN, COIN_SPAWN_INTERVAL_MAX)
-            self.coins.append(Coin(random.randint(0, LANE_COUNT - 1)))
+            self._spawn_coin_row()
 
         still_alive = []
         for coin in self.coins:
@@ -470,6 +518,10 @@ class Game:
             if not coin.resolved and prev_z > Z_NEAR >= coin.z:
                 coin.resolved = True
                 if coin.lane == self._lane_a:
+                    # Coins just accumulate here -- spending SHIELD_COIN_COST
+                    # of them only happens in _try_activate_shield(), on an
+                    # explicit shield-activation message, not automatically
+                    # the moment the count crosses the threshold.
                     self.coins_collected += 1
                     self.score += COIN_SCORE_VALUE
                     coin.destroy()
@@ -506,6 +558,26 @@ class Game:
         self.player.torso.animate_scale(squashed_scale, duration=SQUASH_OUT_DURATION, curve=curve.out_quad)
         self.player.torso.animate_scale(normal_scale, duration=SQUASH_RECOVER_DURATION,
                                          delay=SQUASH_OUT_DURATION, curve=curve.out_quad)
+
+    def _try_activate_shield(self):
+        """Called once per valid shield-activation message received over
+        the websocket (see websocket_server.py / game_state.py). Does
+        nothing if a shield is already active (no stacking) or there
+        aren't enough coins banked -- either way the request is just
+        dropped, not queued for later."""
+        if self.shield_active or self.coins_collected < SHIELD_COIN_COST:
+            return
+        self.coins_collected -= SHIELD_COIN_COST
+        self.shield_active = True
+        self.shield_timer = SHIELD_DURATION_SEC
+
+    def _update_shield_timer(self, dt):
+        if not self.shield_active:
+            return
+        self.shield_timer -= dt
+        if self.shield_timer <= 0:
+            self.shield_active = False
+            self.shield_timer = 0.0
 
     def _update_player(self, dt):
         target_x = lane_x(self._lane_a)
@@ -552,6 +624,11 @@ class Game:
     def draw(self):
         self.score_text.text = f"Score: {int(self.score)}"
         self.coins_text.text = f"Coins: {self.coins_collected}"
+        if self.shield_active:
+            self.shield_text.text = f"Shield: ACTIVE ({self.shield_timer:.1f}s)"
+        else:
+            self.shield_text.text = f"Shield: {self.coins_collected}/{SHIELD_COIN_COST}"
+        self._shield_bubble.enabled = self.shield_active
         self.warn_text.enabled = not self._pose_visible_a
 
     def _show_game_over(self):
